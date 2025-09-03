@@ -1,7 +1,7 @@
 {
   "domain": "smartfilterpro",
   "name": "SmartFilterPro",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "documentation": "https://smartfilterpro.com/ha",
   "issue_tracker": "https://github.com/your-org/smartfilterpro-ha/issues",
   "config_flow": true,
@@ -9,5 +9,6 @@
   "codeowners": ["@your-github"],
   "iot_class": "cloud_push",
   "integration_type": "service",
-  "loggers": ["custom_components.smartfilterpro"]
+  "loggers": ["custom_components.smartfilterpro"],
+  "dependencies": ["application_credentials"]
 }
