@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
+import time
 from datetime import timedelta
+from typing import Optional, Dict
 
 import aiohttp
 from homeassistant.components.sensor import SensorEntity
@@ -17,17 +20,18 @@ from .const import (
     DOMAIN,
     CONF_STATUS_URL,
     CONF_ACCESS_TOKEN,
+    CONF_REFRESH_TOKEN,
+    CONF_EXPIRES_AT,
+    CONF_REFRESH_PATH,
+    CONF_API_BASE,
     CONF_HVAC_UID,
+    DEFAULT_REFRESH_PATH,
+    # skew (seconds) before expiry to refresh early
+    TOKEN_SKEW_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# Expected payload from your workflow (either raw or under "response")
-# {
-#   "percentage_used": <number>,
-#   "today_minutes":   <number>,
-#   "total_minutes":   <number>
-# }
 K_PERCENT = "percentage_used"
 K_TODAY   = "today_minutes"
 K_TOTAL   = "total_minutes"
@@ -38,16 +42,17 @@ FALLBACK_KEYS = {
     K_TOTAL:   ("total", "total_runtime", "1.0.1_Minutes active"),
 }
 
+
 class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
-    """Poll the Bubble status workflow via POST + Bearer."""
+    """Poll the Bubble status workflow via POST + Bearer, with auto refresh."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self.entry = entry
 
         self._status_url: str = entry.data.get(CONF_STATUS_URL) or ""
-        self._token: str | None = entry.data.get(CONF_ACCESS_TOKEN)
-        self._hvac_uid: str | None = entry.data.get(CONF_HVAC_UID)
+        self._api_base: str = (entry.data.get(CONF_API_BASE) or "").rstrip("/")
+        self._refresh_path: str = (entry.data.get(CONF_REFRESH_PATH) or DEFAULT_REFRESH_PATH).strip("/")
 
         if not self._status_url:
             raise ValueError("SmartFilterPro: missing status_url in config entry")
@@ -61,14 +66,78 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
             update_interval=timedelta(minutes=20),
         )
 
-    async def _async_update_data(self) -> dict:
-        headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
+    # -------- token helpers (local; no extra file needed) --------
+    def _access_token(self) -> Optional[str]:
+        return self.entry.data.get(CONF_ACCESS_TOKEN)
 
-        payload = {}
-        if self._hvac_uid:
-            payload["hvac_uid"] = self._hvac_uid   # never in URL; body only
+    def _refresh_token(self) -> Optional[str]:
+        return self.entry.data.get(CONF_REFRESH_TOKEN)
+
+    def _expires_at(self) -> Optional[int]:
+        v = self.entry.data.get(CONF_EXPIRES_AT)
+        return int(v) if v is not None else None
+
+    async def _ensure_valid_token(self) -> None:
+        exp = self._expires_at()
+        if exp is None:
+            return  # treat as long-lived
+        now = int(time.time())
+        if now < exp - TOKEN_SKEW_SECONDS:
+            return
+        await self._refresh_access_token()
+
+    async def _refresh_access_token(self) -> None:
+        rt = self._refresh_token()
+        if not rt:
+            _LOGGER.warning("No refresh_token; cannot refresh access token.")
+            return
+
+        url = f"{self._api_base}/{self._refresh_path}"
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(url, json={"refresh_token": rt}, timeout=20) as r:
+                    text = await r.text()
+                    if r.status >= 400:
+                        _LOGGER.error("Refresh %s -> %s %s", url, r.status, text[:500])
+                        return
+                    data = json.loads(text)
+        except Exception as e:
+            _LOGGER.error("Refresh call failed: %s", e)
+            return
+
+        body = data.get("response", data) if isinstance(data, dict) else {}
+        at = body.get("access_token")
+        new_rt = body.get("refresh_token", rt)
+        exp = body.get("expires_at")
+
+        if not at or exp is None:
+            _LOGGER.error("Refresh response missing access_token/expires_at: %s", body)
+            return
+
+        new_data = dict(self.entry.data)
+        new_data.update({
+            CONF_ACCESS_TOKEN: at,
+            CONF_REFRESH_TOKEN: new_rt,
+            CONF_EXPIRES_AT: int(exp),
+        })
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        # refresh our local handle to the entry
+        self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
+        _LOGGER.debug("Token refreshed; exp=%s", exp)
+
+    # ------------------ main poll ------------------
+    async def _async_update_data(self) -> dict:
+        await self._ensure_valid_token()
+        token = self._access_token()
+        hvac_uid = self.entry.data.get(CONF_HVAC_UID)
+
+        headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        payload: Dict[str, str] = {}
+        if hvac_uid:
+            payload["hvac_uid"] = hvac_uid
 
         try:
             async with self._session.post(
@@ -113,10 +182,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     try:
         await coord.async_config_entry_first_refresh()
     except Exception:
-        # Already logged; entities will show unavailable until next success
+        # already logged; entities will become available on next success
         pass
 
-    # Allow the Reset button to refresh after POST
     hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})["status_coord"] = coord
 
     entities = [
