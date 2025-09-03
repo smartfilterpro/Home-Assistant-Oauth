@@ -1,34 +1,36 @@
-# custom_components/smartfilterpro/const.py
 DOMAIN = "smartfilterpro"
 
+# Existing / common config keys
 CONF_USER_ID = "user_id"
 CONF_HVAC_ID = "hvac_id"
 CONF_ENTITY_ID = "entity_id"
 
 CONF_API_BASE = "api_base"
+CONF_LOGIN_PATH = "login_path"
 CONF_POST_PATH = "post_path"
 CONF_RESOLVER_PATH = "resolver_path"
-CONF_DATA_OBJ_URL = "data_obj_url"
-
-# NEW
 CONF_RESET_PATH = "reset_path"
-CONF_LOGIN_PATH = "login_path"
+
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 
-# Tokens (stored in entry.data after login)
 CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
-CONF_EXPIRES_AT = "expires_at"  # optional if you later add refresh logic
+CONF_EXPIRES_AT = "expires_at"
 
-DEFAULT_API_BASE = "https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/"
-DEFAULT_POST_PATH = "ha_telemetry"
-DEFAULT_RESOLVER_PATH = "ha_resolve_thermostat_obj"
-DEFAULT_RESET_PATH = "ha_reset_filter"
-# NEW (Bubble workflow that exchanges email+password -> tokens + user_id)
-DEFAULT_LOGIN_PATH = "ha_password_login"
+# Legacy (kept for back-compat; not required now)
+CONF_DATA_OBJ_URL = "data_obj_url"
 
-# include button platform
-PLATFORMS = ["sensor", "button"]
+# NEW for status polling
+CONF_STATUS_URL = "status_url"     # workflow we poll (no ids in URL)
+CONF_HVAC_UID   = "hvac_uid"       # unique id we send IN BODY (optional)
 
-STORAGE_KEY = "session"
+# Defaults (update base/path if you switch from version-test to live)
+DEFAULT_API_BASE       = "https://smartfilterpro-scaling.bubbleapps.io"
+DEFAULT_LOGIN_PATH     = "version-test/api/1.1/wf/ha_password_login"
+DEFAULT_POST_PATH      = "version-test/api/1.1/wf/ha_telemetry"
+DEFAULT_RESOLVER_PATH  = "version-test/api/1.1/wf/ha_resolve_thermostat_obj"
+DEFAULT_RESET_PATH     = "version-test/api/1.1/wf/ha_reset_filter"
+
+# NEW: the backend status workflow
+DEFAULT_STATUS_PATH    = "version-test/api/1.1/wf/ha_therm_status"
