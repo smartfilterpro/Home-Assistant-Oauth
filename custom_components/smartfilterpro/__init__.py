@@ -60,9 +60,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     session = aiohttp.ClientSession()
     run_state = {"active_since": None, "last_action": None}
 
+    # Optional bearer token support (if you store access_token in entry.data)
+    access_token = entry.data.get("access_token")
+
     async def _post(url, payload):
         try:
-            async with session.post(url, json=payload, timeout=20) as resp:
+            headers = {}
+            if access_token:
+                headers["Authorization"] = f"Bearer {access_token}"
+            async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
                 txt = await resp.text()
                 if resp.status >= 400:
                     _LOGGER.error(
