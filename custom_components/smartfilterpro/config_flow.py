@@ -44,6 +44,8 @@ STEP_HVAC_SCHEMA = vol.Schema({
 })
 
 
+from homeassistant import config_entries
+from .const import DOMAIN
 class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
