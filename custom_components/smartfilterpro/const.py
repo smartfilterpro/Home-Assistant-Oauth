@@ -4,7 +4,7 @@ DOMAIN = "smartfilterpro"
 # Add these to satisfy older imports that expect storage constants:
 STORAGE_KEY = DOMAIN        # or "smartfilterpro"
 STORAGE_VERSION = 1         # bump if you ever migrate stored data
-Platforms = ["sensor", "button"]
+PLATFORMS = ["sensor", "button"]
 
 # Existing / common config keys
 CONF_USER_ID = "user_id"
