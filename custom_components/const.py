@@ -22,3 +22,10 @@ DEFAULT_RESET_PATH = "ha_reset_filter"
 PLATFORMS = ["sensor", "button"]
 
 STORAGE_KEY = "session"
+
+# ===== OAuth2 provider endpoints (Bubble/SFP) =====
+# Set these to your Bubble OAuth provider endpoints
+OAUTH2_AUTHORIZE = "https://smartfilterpro.com/oauth/authorize"
+OAUTH2_TOKEN = "https://smartfilterpro.com/oauth/token"
+SCOPES = ["openid", "profile", "email"]  # adjust to what your provider issues
+USERINFO_URL = "https://smartfilterpro.com/oauth/userinfo"  # optional
