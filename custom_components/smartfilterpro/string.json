@@ -2,29 +2,25 @@
   "config": {
     "step": {
       "user": {
-        "title": "SmartFilterPro — Account & Link",
-        "description": "Enter your SmartFilterPro IDs. We'll resolve the hidden Bubble object.",
-        "data": {
-          "user_id": "SmartFilterPro USER_ID",
-          "hvac_id": "SmartFilterPro HVAC_ID",
-          "api_base": "Bubble API base (wf root)",
-          "post_path": "Telemetry workflow path",
-          "resolver_path": "Resolver workflow path",
-          "reset_path": "Reset workflow path"
-        }
+        "title": "SmartFilterPro — Sign In",
+        "description": "Enter your SmartFilterPro email and password to link your account.",
+        "data": { "email": "Email address", "password": "Password" }
+      },
+      "select_hvac": {
+        "title": "Select Thermostat",
+        "description": "Multiple SmartFilterPro devices were found. Choose which HVAC to link.",
+        "data": { "hvac_id": "Thermostat" }
       },
       "select_entity": {
-        "title": "Choose Thermostat",
+        "title": "Choose Thermostat Entity",
         "description": "Pick the Home Assistant climate entity to forward to SmartFilterPro.",
-        "data": {
-          "entity_id": "Thermostat (climate.*)"
-        }
+        "data": { "entity_id": "Thermostat (climate.*)" }
       }
     },
     "error": {
       "required": "Required",
       "cannot_connect": "Could not connect. Check server/workflow.",
-      "not_found": "No match for this USER_ID/HVAC_ID",
+      "not_found": "We could not find a thermostat for this account.",
       "no_climate": "No climate entities found in Home Assistant."
     }
   }
