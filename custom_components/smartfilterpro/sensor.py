@@ -42,7 +42,7 @@ class SfpObjCoordinator(DataUpdateCoordinator[dict]):
             hass,
             _LOGGER,
             name=f"{DOMAIN}_obj",
-            update_interval=timedelta(minutes=20),
+            update_interval=timedelta(minutes=5),
         )
 
     def _cache_busted_url(self) -> str:
