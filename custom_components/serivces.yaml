@@ -1,0 +1,3 @@
+send_now:
+  name: Send Now
+  description: Immediately post a snapshot of the selected thermostat's state to Bubble.
