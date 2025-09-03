@@ -18,6 +18,12 @@ CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_EXPIRES_AT = "expires_at"
 
+CONF_REFRESH_TOKEN = "refresh_token"
+CONF_EXPIRES_AT    = "expires_at"         # epoch seconds for access token
+CONF_REFRESH_PATH  = "refresh_path"
+DEFAULT_REFRESH_PATH = "version-test/api/1.1/wf/ha_refresh_token"
+TOKEN_SKEW_SECONDS = 300  # refresh 5 min early
+
 # Legacy (kept for back-compat; not required now)
 CONF_DATA_OBJ_URL = "data_obj_url"
 
