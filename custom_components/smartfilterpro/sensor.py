@@ -1,8 +1,6 @@
-# custom_components/smartfilterpro/sensor.py
 from __future__ import annotations
 
 import logging
-import time
 from datetime import timedelta
 
 import aiohttp
@@ -15,127 +13,135 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
 
-from .const import DOMAIN, CONF_DATA_OBJ_URL
+from .const import (
+    DOMAIN,
+    CONF_STATUS_URL,
+    CONF_ACCESS_TOKEN,
+    CONF_HVAC_UID,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-# Keys expected on your Bubble Data API object
-FIELD_PERCENT = "percentage used"
-FIELD_TODAY = "2.0.1_Daily Active Time Sum"
-FIELD_TOTAL = "1.0.1_Minutes active"
+# Expected payload from your workflow (either raw or under "response")
+# {
+#   "percentage_used": <number>,
+#   "today_minutes":   <number>,
+#   "total_minutes":   <number>
+# }
+K_PERCENT = "percentage_used"
+K_TODAY   = "today_minutes"
+K_TOTAL   = "total_minutes"
 
+FALLBACK_KEYS = {
+    K_PERCENT: ("percentage", "percent_used", "percentage used"),
+    K_TODAY:   ("today", "todays_minutes", "2.0.1_Daily Active Time Sum"),
+    K_TOTAL:   ("total", "total_runtime", "1.0.1_Minutes active"),
+}
 
-class SfpObjCoordinator(DataUpdateCoordinator[dict]):
-    """Coordinator that polls the Bubble Data API object."""
+class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
+    """Poll the Bubble status workflow via POST + Bearer."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self.entry = entry
-        self._base_url = entry.data.get(CONF_DATA_OBJ_URL, "")
-        if not self._base_url:
-            raise ValueError("Missing CONF_DATA_OBJ_URL in config entry data")
 
-        self._access_token = entry.data.get("access_token")
+        self._status_url: str = entry.data.get(CONF_STATUS_URL) or ""
+        self._token: str | None = entry.data.get(CONF_ACCESS_TOKEN)
+        self._hvac_uid: str | None = entry.data.get(CONF_HVAC_UID)
+
+        if not self._status_url:
+            raise ValueError("SmartFilterPro: missing status_url in config entry")
+
         self._session: aiohttp.ClientSession = async_get_clientsession(hass)
 
         super().__init__(
             hass,
             _LOGGER,
-            name=f"{DOMAIN}_obj",
-            update_interval=timedelta(minutes=5),
+            name=f"{DOMAIN}_status",
+            update_interval=timedelta(minutes=20),
         )
 
-    def _cache_busted_url(self) -> str:
-        ts = int(time.time() * 1000)
-        sep = "&" if "?" in self._base_url else "?"
-        return f"{self._base_url}{sep}_ts={ts}"
-
     async def _async_update_data(self) -> dict:
-        url = self._cache_busted_url()
-        headers = {"Cache-Control": "no-cache"}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
+        headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+
+        payload = {}
+        if self._hvac_uid:
+            payload["hvac_uid"] = self._hvac_uid   # never in URL; body only
 
         try:
-            async with self._session.get(url, headers=headers, timeout=20) as resp:
+            async with self._session.post(
+                self._status_url, json=(payload or None), headers=headers, timeout=25
+            ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    # Raise so HA shows it in logs and marks coordinator failed (not uninstalling the platform)
                     raise RuntimeError(
-                        f"Data API GET {url} -> {resp.status} {text[:500]}"
+                        f"Status POST {self._status_url} -> {resp.status} {text[:500]}"
                     )
-                # The Bubble Data API sometimes returns {"response": {...}}
                 try:
                     data = await resp.json()
                 except Exception as e:
-                    raise RuntimeError(f"Non-JSON response from Data API: {text[:300]}") from e
-
-                body = data.get("response") or data
-                if not isinstance(body, dict):
-                    raise RuntimeError(f"Unexpected JSON shape: {body!r}")
-                return body
+                    raise RuntimeError(f"Non-JSON response: {text[:300]}") from e
         except Exception as e:
-            _LOGGER.error("SmartFilterPro Data API fetch failed: %s", e)
-            # Re-raise so HA shows the error and the entities become unavailable (not removed)
+            _LOGGER.error("SmartFilterPro status fetch failed: %s", e)
             raise
 
+        body = data.get("response") if isinstance(data, dict) else None
+        if not body:
+            body = data
+        if not isinstance(body, dict):
+            raise RuntimeError(f"Unexpected JSON shape: {body!r}")
 
-async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
-) -> None:
-    """Set up SmartFilterPro sensors."""
-    try:
-        coord = SfpObjCoordinator(hass, entry)
-    except Exception as e:
-        _LOGGER.exception("Sensor setup failed before first refresh: %s", e)
-        return
+        def pick(key, *alts):
+            if key in body:
+                return body[key]
+            for a in alts:
+                if a in body:
+                    return body[a]
+            return None
 
-    # First refresh; if this raises, entities won't be added (but you'll see the log)
+        return {
+            K_PERCENT: pick(K_PERCENT, *FALLBACK_KEYS[K_PERCENT]),
+            K_TODAY:   pick(K_TODAY,   *FALLBACK_KEYS[K_TODAY]),
+            K_TOTAL:   pick(K_TOTAL,   *FALLBACK_KEYS[K_TOTAL]),
+        }
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
+    coord = SfpStatusCoordinator(hass, entry)
     try:
         await coord.async_config_entry_first_refresh()
     except Exception:
-        # Error already logged in coordinator; continue so entities register as unavailable
+        # Already logged; entities will show unavailable until next success
         pass
 
-    # Stash the coordinator so the reset button can force refreshes
-    hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})["obj_coord"] = coord
+    # Allow the Reset button to refresh after POST
+    hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})["status_coord"] = coord
 
-    sensors = [
-        SfpFieldSensor(coord, FIELD_PERCENT, "SmartFilterPro Percentage Used", "%", round_1=True, uid="percentage_used"),
-        SfpFieldSensor(coord, FIELD_TODAY, "SmartFilterPro Today's Usage", "min", uid="todays_usage"),
-        SfpFieldSensor(coord, FIELD_TOTAL, "SmartFilterPro Total Minutes", "min", uid="total_minutes"),
+    entities = [
+        SfpFieldSensor(coord, K_PERCENT, "SmartFilterPro Percentage Used", "%", round_1=True, uid="percentage_used"),
+        SfpFieldSensor(coord, K_TODAY,   "SmartFilterPro Today's Usage",   "min", uid="todays_usage"),
+        SfpFieldSensor(coord, K_TOTAL,   "SmartFilterPro Total Minutes",   "min", uid="total_minutes"),
     ]
-    async_add_entities(sensors)
+    async_add_entities(entities)
 
 
-class SfpFieldSensor(CoordinatorEntity[SfpObjCoordinator], SensorEntity):
-    """Sensor that exposes a single field from the Bubble object."""
-
-    def __init__(
-        self,
-        coordinator: SfpObjCoordinator,
-        field_key: str,
-        name: str,
-        unit: str | None,
-        *,
-        round_1: bool = False,
-        uid: str,
-    ) -> None:
+class SfpFieldSensor(CoordinatorEntity[SfpStatusCoordinator], SensorEntity):
+    def __init__(self, coordinator, field_key, name, unit, *, round_1=False, uid: str):
         super().__init__(coordinator)
         self._key = field_key
         self._attr_name = name
-        # Keep stable unique_ids so entities don’t “disappear” on updates
         self._attr_unique_id = f"{DOMAIN}_{uid}"
         self._attr_native_unit_of_measurement = unit
         self._round_1 = round_1
 
     @property
     def native_value(self):
-        body = self.coordinator.data or {}
-        val = body.get(self._key)
+        val = (self.coordinator.data or {}).get(self._key)
         if self._round_1 and isinstance(val, (int, float)):
             try:
                 return round(float(val), 1)
-            except Exception:  # defensive
+            except Exception:
                 return val
         return val
