@@ -57,4 +57,4 @@ After installation and restart, add the integration:
 
 ## Disclaimer
 
-This is a custom integration and is **not yet part of Home Assistant Core**. Install at your own risk.  
+This is a custom integration and is **not yet part of Home Assistant Core**.
