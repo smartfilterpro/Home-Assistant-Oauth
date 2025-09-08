@@ -6,6 +6,7 @@ from typing import Optional, Any, Iterable
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
 
 from .const import (
@@ -17,6 +18,7 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
 
 def _normalize_hvac(val: Any) -> Optional[str]:
     if val is None:
@@ -38,7 +40,9 @@ def _normalize_hvac(val: Any) -> Optional[str]:
             return s or None
     return s or None
 
+
 async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Optional[str]:
+    """Return an access token, refreshing with the refresh_token if near expiry."""
     exp = entry.data.get(CONF_EXPIRES_AT)
     exp = int(exp) if exp is not None else None
     if exp is not None and int(time.time()) >= exp - TOKEN_SKEW_SECONDS:
@@ -48,25 +52,37 @@ async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Option
             refresh_path = (entry.data.get(CONF_REFRESH_PATH) or DEFAULT_REFRESH_PATH).strip("/")
             url = f"{api_base}/{refresh_path}"
             try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.post(url, json={"refresh_token": rt}, timeout=20) as r:
-                        text = await r.text()
-                        if r.status < 400:
-                            data = json.loads(text)
-                            body = data.get("response", data) if isinstance(data, dict) else {}
-                            at = body.get("access_token")
-                            new_rt = body.get("refresh_token", rt)
-                            new_exp = body.get("expires_at")
-                            if at and new_exp is not None:
-                                new_data = dict(entry.data)
-                                new_data.update({"access_token": at, "refresh_token": new_rt, "expires_at": int(new_exp)})
-                                hass.config_entries.async_update_entry(entry, data=new_data)
+                async with async_get_clientsession(hass).post(
+                    url, json={"refresh_token": rt}, timeout=20
+                ) as r:
+                    text = await r.text()
+                    if r.status < 400:
+                        data = json.loads(text) if text else {}
+                        body = data.get("response", data) if isinstance(data, dict) else {}
+                        at = body.get("access_token")
+                        new_rt = body.get("refresh_token", rt)
+                        new_exp = body.get("expires_at")
+                        if at and new_exp is not None:
+                            new_data = dict(entry.data)
+                            new_data.update({
+                                "access_token": at,
+                                "refresh_token": new_rt,
+                                "expires_at": int(new_exp),
+                            })
+                            hass.config_entries.async_update_entry(entry, data=new_data)
+                            _LOGGER.debug("SFP reset: token refreshed; exp=%s", new_exp)
+                    else:
+                        _LOGGER.error("SFP reset: refresh %s -> %s %s", url, r.status, text[:500])
             except Exception as e:
-                _LOGGER.error("Refresh before reset failed: %s", e)
-    return (hass.config_entries.async_get_entry(entry.entry_id).data).get(CONF_ACCESS_TOKEN)
+                _LOGGER.error("SFP reset: refresh call failed: %s", e)
+
+    updated = hass.config_entries.async_get_entry(entry.entry_id)
+    return (updated.data if updated else entry.data).get(CONF_ACCESS_TOKEN)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     async_add_entities([SmartFilterProResetButton(hass, entry)], True)
+
 
 class SmartFilterProResetButton(ButtonEntity):
     _attr_name = "Reset Filter Usage"
@@ -75,8 +91,6 @@ class SmartFilterProResetButton(ButtonEntity):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
         self.hass = hass
         self.entry = entry
-
-        # Unique id can keep hvac id for uniqueness
         raw = entry.data.get(CONF_HVAC_ID, "unknown")
         hvac_id = _normalize_hvac(raw) or "unknown"
         self._attr_unique_id = f"{DOMAIN}_reset_{entry.entry_id}_{hvac_id}"
@@ -88,8 +102,8 @@ class SmartFilterProResetButton(ButtonEntity):
 
         # Pull latest name from the status coordinator (Bubble)
         coord = (self.hass.data.get(DOMAIN, {})
-                            .get(self.entry.entry_id, {})
-                            .get("status_coord"))
+                           .get(self.entry.entry_id, {})
+                           .get("status_coord"))
         bubble_name = None
         if coord and isinstance(coord.data, dict):
             bubble_name = coord.data.get("device_name")
@@ -111,6 +125,25 @@ class SmartFilterProResetButton(ButtonEntity):
             model="Filter telemetry bridge",
         )
 
+    async def _post_reset(self, url: str, payload: dict, headers: dict) -> bool:
+        """POST reset, handle 401 by returning False so caller can refresh+retry."""
+        try:
+            async with async_get_clientsession(self.hass).post(
+                url, json=payload, headers=headers, timeout=25
+            ) as resp:
+                txt = await resp.text()
+                if resp.status == 401:
+                    _LOGGER.warning("SFP reset: 401 (will try a token refresh). Response: %s", txt[:500])
+                    return False
+                if resp.status >= 400:
+                    _LOGGER.error("SFP reset: POST %s -> %s %s | payload=%s", url, resp.status, txt[:500], payload)
+                    return False
+                _LOGGER.debug("SFP reset: OK (%s): %s", resp.status, txt[:300])
+                return True
+        except Exception as e:
+            _LOGGER.error("SFP reset: request failed: %s", e)
+            return False
+
     async def async_press(self) -> None:
         api_base = (self.entry.data.get(CONF_API_BASE) or "").rstrip("/")
         reset_path = (self.entry.data.get(CONF_RESET_PATH) or DEFAULT_RESET_PATH).strip("/")
@@ -118,28 +151,30 @@ class SmartFilterProResetButton(ButtonEntity):
         hvac_id = _normalize_hvac(self.entry.data.get(CONF_HVAC_ID))
 
         if not api_base or not user_id or not hvac_id:
-            _LOGGER.error("Reset aborted: missing api_base/user_id/hvac_id")
+            _LOGGER.error("SFP reset: aborted (missing api_base/user_id/hvac_id)")
             return
 
+        url = f"{api_base}/{reset_path}"
+        payload = {"user_id": user_id, "hvac_id": hvac_id}
+
+        # 1) ensure token, try once
         token = await _ensure_valid_token(self.hass, self.entry)
-        headers = {}
+        headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
-        url = f"{api_base}/{reset_path}"
-        ok = False
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(url, json={"user_id": user_id, "hvac_id": hvac_id}, headers=headers, timeout=25) as resp:
-                    txt = await resp.text()
-                    if resp.status >= 400:
-                        _LOGGER.error("Reset POST %s -> %s %s", url, resp.status, txt[:500])
-                    else:
-                        _LOGGER.debug("Reset OK: %s", txt[:250])
-                        ok = True
-        except Exception as e:
-            _LOGGER.error("Reset request failed: %s", e)
+        _LOGGER.debug("SFP reset: POST %s payload=%s", url, payload)
+        ok = await self._post_reset(url, payload, headers)
 
+        # 2) if 401, refresh token and retry once
+        if not ok:
+            token = await _ensure_valid_token(self.hass, self.entry)  # will refresh if needed
+            headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            ok = await self._post_reset(url, payload, headers)
+
+        # 3) on success, refresh status sensors to reflect the reset
         if ok:
             coord = (self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {}).get("status_coord"))
             if coord:
