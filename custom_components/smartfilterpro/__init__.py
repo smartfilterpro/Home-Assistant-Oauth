@@ -1,4 +1,3 @@
-# custom_components/smartfilterpro/__init__.py
 from __future__ import annotations
 
 import logging
@@ -11,49 +10,21 @@ import aiohttp
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
 
 from .const import (
     DOMAIN,
-    CONF_API_BASE,
-    CONF_POST_PATH,
-    CONF_USER_ID,
-    CONF_HVAC_ID,
-    CONF_CLIMATE_ENTITY_ID,   # <-- use this
-    STORAGE_KEY,
     PLATFORMS,
-    DEFAULT_RESET_PATH,
-    CONF_RESET_PATH,
-    CONF_ACCESS_TOKEN,
-    CONF_REFRESH_TOKEN,
-    CONF_EXPIRES_AT,
-    CONF_REFRESH_PATH,
-    CONF_STATUS_URL,
-    DEFAULT_REFRESH_PATH,
-    TOKEN_SKEW_SECONDS,
+    STORAGE_KEY,
+    # ids
+    CONF_USER_ID, CONF_HVAC_ID, CONF_CLIMATE_ENTITY_ID,
+    # posting
+    CONF_API_BASE, CONF_POST_PATH,
+    # tokens / refresh
+    CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_EXPIRES_AT,
+    CONF_REFRESH_PATH, DEFAULT_REFRESH_PATH, TOKEN_SKEW_SECONDS,
 )
-
-
-# --- Optional OAuth constants (fallbacks if missing) ---
-try:
-    from .const import (
-        CONF_ACCESS_TOKEN,
-        CONF_REFRESH_TOKEN,
-        CONF_EXPIRES_AT,
-        CONF_REFRESH_PATH,
-        DEFAULT_REFRESH_PATH,
-        TOKEN_SKEW_SECONDS,
-    )
-    _OAUTH_CONSTS_OK = True
-except Exception:
-    # Provide safe defaults if your current const.py doesn't define these yet
-    CONF_ACCESS_TOKEN = "access_token"
-    CONF_REFRESH_TOKEN = "refresh_token"
-    CONF_EXPIRES_AT = "expires_at"
-    CONF_REFRESH_PATH = "oauth/refresh"
-    DEFAULT_REFRESH_PATH = "oauth/refresh"
-    TOKEN_SKEW_SECONDS = 60
-    _OAUTH_CONSTS_OK = False
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,60 +32,55 @@ ACTIVE_ACTIONS = {"heating", "cooling", "fan"}
 ENTRY_VERSION = 2
 
 
-async def async_migrate_entry(hass, entry: ConfigEntry) -> bool:
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry.version is None:
         entry.version = 1
-
     if entry.version == 1:
         data = {**entry.data}
-        data.setdefault(CONF_RESET_PATH, DEFAULT_RESET_PATH)
         hass.config_entries.async_update_entry(entry, data=data, version=2)
         _LOGGER.info("Migrated SmartFilterPro entry from v1 to v2")
-        return True
     return True
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Optional[str]:
-    """Ensure access token is valid, refresh if expired; log lifecycle."""
+    """Ensure access token is valid; refresh if expired."""
     data = entry.data or {}
-    exp = int(data.get(CONF_EXPIRES_AT) or 0)
+    access_token = data.get(CONF_ACCESS_TOKEN)
+    exp = data.get(CONF_EXPIRES_AT)
+    exp = int(exp) if exp is not None else None
     now = int(time.time())
 
-    if not _OAUTH_CONSTS_OK:
-        # Using fallbacks—still attempt refresh if these keys exist in entry.data
-        _LOGGER.debug("OAuth consts not found in const.py; using fallback keys.")
+    _LOGGER.debug("SFP token check: now=%s exp=%s skew=%s", now, exp, TOKEN_SKEW_SECONDS)
 
-    if exp:
-        _LOGGER.debug("Token check: now=%s exp=%s (skew=%s)", now, exp, TOKEN_SKEW_SECONDS)
-
-    if exp and now >= (exp - TOKEN_SKEW_SECONDS):
+    if exp is not None and now >= exp - TOKEN_SKEW_SECONDS:
         rt = data.get(CONF_REFRESH_TOKEN)
         if not rt:
-            _LOGGER.warning("Token expired, but no refresh_token available")
-            return data.get(CONF_ACCESS_TOKEN)
+            _LOGGER.warning("SFP token appears expired, but no refresh_token present.")
+            return access_token
 
         api_base = (data.get(CONF_API_BASE) or "").rstrip("/")
         refresh_path = (data.get(CONF_REFRESH_PATH) or DEFAULT_REFRESH_PATH).strip("/")
         url = f"{api_base}/{refresh_path}"
+        _LOGGER.info("SFP refreshing access token at %s", url)
 
-        _LOGGER.info("Refreshing access token at %s", url)
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.post(url, json={"refresh_token": rt}, timeout=20) as resp:
                     txt = await resp.text()
+                    _LOGGER.debug("SFP refresh response (%s): %s", resp.status, txt[:500])
                     if resp.status >= 400:
-                        _LOGGER.error("Token refresh failed %s -> %s %s", url, resp.status, txt[:300])
+                        _LOGGER.error("SFP refresh failed %s -> %s %s", url, resp.status, txt[:300])
                     else:
                         js = json.loads(txt) if txt else {}
                         body = js.get("response", js) if isinstance(js, dict) else {}
                         at = body.get("access_token")
                         new_rt = body.get("refresh_token", rt)
                         new_exp = body.get("expires_at")
-                        if at and new_exp:
+                        if at and new_exp is not None:
                             new_data = dict(data)
                             new_data.update({
                                 CONF_ACCESS_TOKEN: at,
@@ -122,17 +88,31 @@ async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Option
                                 CONF_EXPIRES_AT: int(new_exp),
                             })
                             hass.config_entries.async_update_entry(entry, data=new_data)
-                            _LOGGER.info("Token refresh succeeded, new expiry=%s", new_exp)
+                            _LOGGER.info("SFP token refresh succeeded; new expiry=%s", new_exp)
+                            access_token = at
         except Exception as e:
-            _LOGGER.error("Token refresh error: %s", e)
+            _LOGGER.error("SFP token refresh error: %s", e)
 
-    # Return current token (possibly refreshed)
-    return (hass.config_entries.async_get_entry(entry.entry_id).data or {}).get(CONF_ACCESS_TOKEN)
+    final_token = (hass.config_entries.async_get_entry(entry.entry_id).data or {}).get(CONF_ACCESS_TOKEN, access_token)
+    if final_token:
+        _LOGGER.debug("SFP using access token (len=%s).", len(str(final_token)))
+    else:
+        _LOGGER.warning("SFP no access token available; requests will be unauthenticated.")
+    return final_token
 
 
-def _build_payload(state, user_id, hvac_id, entity_id,
-                   runtime_seconds=None, cycle_start=None, cycle_end=None,
-                   connected=False, device_name=None):
+def _build_payload(
+    state,
+    user_id: str,
+    hvac_id: str,
+    entity_id: str,
+    runtime_seconds: Optional[int] = None,
+    cycle_start: Optional[str] = None,
+    cycle_end: Optional[str] = None,
+    connected: bool = False,
+    device_name: Optional[str] = None,
+) -> dict:
+    """Original Bubble payload shape (what your backend expects)."""
     attrs = state.attributes if state else {}
     hvac_action = attrs.get("hvac_action")
     is_active = hvac_action in ACTIVE_ACTIONS
@@ -140,7 +120,7 @@ def _build_payload(state, user_id, hvac_id, entity_id,
         "user_id": user_id,
         "hvac_id": hvac_id,
         "ha_entity_id": entity_id,
-        "ts": _now().isoformat(),
+        "ts": _now_iso(),
         "current_temperature": attrs.get("current_temperature"),
         "target_temperature": attrs.get("temperature"),
         "target_temp_high": attrs.get("target_temp_high"),
@@ -158,112 +138,166 @@ def _build_payload(state, user_id, hvac_id, entity_id,
     }
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    api_base = entry.data[CONF_API_BASE].rstrip("/")
-    post_path = entry.data[CONF_POST_PATH].strip("/")
-    user_id = entry.data[CONF_USER_ID]
-    hvac_id = entry.data[CONF_HVAC_ID]
-    entity_id = entry.data[CONF_CLIMATE_ENTITY_ID]
+async def async_setup(hass: HomeAssistant, config: dict):
+    return True
 
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+    """Set up telemetry watcher (if a climate entity was chosen) and load platforms."""
+    api_base = (entry.data.get(CONF_API_BASE) or "").rstrip("/")
+    post_path = (entry.data.get(CONF_POST_PATH) or "").strip("/")
+    user_id = entry.data.get(CONF_USER_ID)
+    hvac_id = entry.data.get(CONF_HVAC_ID)
+    climate_eid = entry.data.get(CONF_CLIMATE_ENTITY_ID)  # optional
+
+    if not api_base or not post_path or not user_id or not hvac_id:
+        _LOGGER.error("SFP missing required config (api_base/post_path/user_id/hvac_id). Telemetry disabled.")
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        return True
 
     telemetry_url = f"{api_base}/{post_path}"
-    session = aiohttp.ClientSession()
+    session = async_get_clientsession(hass)
+
     run_state = {"active_since": None, "last_action": None}
 
-    async def _post(url, payload):
-        _LOGGER.debug("SFP POST payload -> %s", payload)
+    async def _post(payload: dict) -> None:
         token = await _ensure_valid_token(hass, entry)
         headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        _LOGGER.debug("SFP POST url=%s headers=%s payload=%s", telemetry_url, list(headers.keys()), payload)
         try:
-            async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
+            async with session.post(telemetry_url, json=payload, headers=headers, timeout=20) as resp:
                 txt = await resp.text()
-                if resp.status >= 400:
-                    _LOGGER.error("SFP POST %s -> %s %s | payload=%s", url, resp.status, txt[:500], payload)
-                else:
-                    _LOGGER.debug("SFP POST ok: %s", txt[:200])
-        except Exception as e:
-            _LOGGER.error("SFP POST failed: %s", e)
 
-    async def _handle_state(new_state):
+                # --- 401: refresh then retry once ---
+                if resp.status == 401:
+                    _LOGGER.warning("SFP POST 401 Unauthorized. Forcing token refresh and retrying once.")
+                    await _ensure_valid_token(hass, entry)
+                    token2 = (hass.config_entries.async_get_entry(entry.entry_id).data or {}).get(CONF_ACCESS_TOKEN)
+                    headers2 = dict(headers)
+                    if token2:
+                        headers2["Authorization"] = f"Bearer {token2}"
+                    async with session.post(telemetry_url, json=payload, headers=headers2, timeout=20) as r2:
+                        t2 = await r2.text()
+                        if r2.status >= 400:
+                            _LOGGER.error("SFP POST retry failed %s -> %s %s | payload=%s",
+                                          telemetry_url, r2.status, t2[:500], payload)
+                        else:
+                            _LOGGER.debug("SFP POST retry OK (%s): %s", r2.status, t2[:300])
+                    return
+                # -----------------------------------
+
+                if resp.status >= 400:
+                    _LOGGER.error("SFP POST %s -> %s %s | payload=%s", telemetry_url, resp.status, txt[:500], payload)
+                else:
+                    _LOGGER.debug("SFP POST OK (%s): %s", resp.status, txt[:300])
+        except Exception as e:
+            _LOGGER.error("SFP POST error: %s", e)
+
+    async def _handle_state(new_state) -> None:
+        """Send payload on every climate state change; mark cycle start/stop."""
         hvac_action = (new_state.attributes or {}).get("hvac_action")
         last = run_state["last_action"]
         was_active = last in ACTIVE_ACTIONS
         is_active = hvac_action in ACTIVE_ACTIONS
 
         payload = None
-        now = _now()
+        now = datetime.now(timezone.utc)
 
         if not was_active and is_active:
+            # cycle start
             run_state["active_since"] = now
             payload = _build_payload(
-                new_state, user_id, hvac_id, entity_id,
+                new_state,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=new_state.entity_id,
                 connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
-                device_name=new_state.name
+                device_name=new_state.name,
             )
+            _LOGGER.debug("SFP cycle start detected: %s", hvac_action)
 
         elif was_active and not is_active:
-            start = run_state["active_since"]
-            if start:
-                secs = int((now - start).total_seconds())
-                payload = _build_payload(
-                    new_state, user_id, hvac_id, entity_id,
-                    runtime_seconds=secs,
-                    cycle_start=start.isoformat(),
-                    cycle_end=now.isoformat(),
-                    connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
-                    device_name=new_state.name
-                )
+            # cycle end
+            start = run_state.get("active_since")
+            secs = int((now - start).total_seconds()) if start else 0
+            payload = _build_payload(
+                new_state,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=new_state.entity_id,
+                runtime_seconds=secs,
+                cycle_start=start.isoformat() if start else None,
+                cycle_end=now.isoformat(),
+                connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
+                device_name=new_state.name,
+            )
             run_state["active_since"] = None
+            _LOGGER.debug("SFP cycle end detected; duration=%ss", secs)
 
         else:
+            # steady-state ping
             payload = _build_payload(
-                new_state, user_id, hvac_id, entity_id,
+                new_state,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=new_state.entity_id,
                 connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
-                device_name=new_state.name
+                device_name=new_state.name,
             )
 
         run_state["last_action"] = hvac_action
         if payload:
-            await _post(telemetry_url, payload)
+            await _post(payload)
 
     @callback
     async def _on_change(event):
         new = event.data.get("new_state")
-        if new and new.entity_id == entity_id:
+        if new and (not climate_eid or new.entity_id == climate_eid):
             await _handle_state(new)
 
-    unsub = async_track_state_change_event(hass, [entity_id], _on_change)
+    # Only watch telemetry if a climate entity was chosen in the flow
+    unsub_telemetry = None
+    if climate_eid:
+        _LOGGER.debug("SFP telemetry watching %s", climate_eid)
+        unsub_telemetry = async_track_state_change_event(hass, [climate_eid], _on_change)
 
-    st = hass.states.get(entity_id)
-    if st:
-        run_state["last_action"] = st.attributes.get("hvac_action")
-        if run_state["active_since"] is None and run_state["last_action"] in ACTIVE_ACTIONS:
-            run_state["active_since"] = _now()
-        await _handle_state(st)
+        # Prime an initial send
+        st = hass.states.get(climate_eid)
+        if st:
+            run_state["last_action"] = st.attributes.get("hvac_action")
+            if run_state["active_since"] is None and run_state["last_action"] in ACTIVE_ACTIONS:
+                run_state["active_since"] = datetime.now(timezone.utc)
+            await _handle_state(st)
+    else:
+        _LOGGER.debug("SFP telemetry disabled (no climate entity chosen)")
 
     async def _svc_send_now(call):
-        s = hass.states.get(entity_id)
+        if not climate_eid:
+            _LOGGER.warning("SFP send_now called but no climate entity configured.")
+            return
+        s = hass.states.get(climate_eid)
         if s:
             await _post(
-                telemetry_url,
                 _build_payload(
-                    s, user_id, hvac_id, entity_id,
+                    s,
+                    user_id=user_id,
+                    hvac_id=hvac_id,
+                    entity_id=climate_eid,
                     connected=s.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
-                    device_name=s.name
+                    device_name=s.name,
                 )
             )
+
     hass.services.async_register(DOMAIN, "send_now", _svc_send_now)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        STORAGE_KEY: {"session": session, "unsub": unsub, "run_state": run_state}
+        STORAGE_KEY: {"unsub_telemetry": unsub_telemetry}
     }
     entry.async_on_unload(entry.add_update_listener(_reload))
-    if not _OAUTH_CONSTS_OK:
-        _LOGGER.info("SmartFilterPro OAuth constants not found in const.py; using fallback keys.")
     return True
 
 
@@ -274,13 +308,11 @@ async def _reload(hass: HomeAssistant, entry: ConfigEntry):
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     data = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if data and STORAGE_KEY in data:
-        try:
-            data[STORAGE_KEY]["unsub"]()
-        except Exception:
-            pass
-        try:
-            await data[STORAGE_KEY]["session"].close()
-        except Exception:
-            pass
+        unsub = data[STORAGE_KEY].get("unsub_telemetry")
+        if unsub:
+            try:
+                unsub()
+            except Exception:
+                pass
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     return unload_ok
