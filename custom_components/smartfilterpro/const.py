@@ -39,7 +39,7 @@ DEFAULT_POST_PATH = "version-test/api/1.1/wf/ha_telemetry"
 DEFAULT_RESOLVER_PATH = "version-test/api/1.1/wf/ha_resolve_thermostat_obj"
 DEFAULT_RESET_PATH = "version-test/api/1.1/wf/ha_reset_filter"
 DEFAULT_STATUS_URL = "version-test/api/1.1/wf/ha_therm_status"
-DEFAULT_REFRESH_PATH = "version-test/api/1.1/wf/ha_refresh_token/initialize"
+DEFAULT_REFRESH_PATH = "version-test/api/1.1/wf/ha_refresh_token"
 
 # Refresh 5 minutes before expiry to avoid clock skew
 TOKEN_SKEW_SECONDS = 300
