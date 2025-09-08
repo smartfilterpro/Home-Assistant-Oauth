@@ -155,7 +155,6 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
 
         raw_hvac = self.entry.data.get(CONF_HVAC_UID) or self.entry.data.get(CONF_HVAC_ID)
         hvac_uid = _normalize_hvac(raw_hvac)
-        user_id  = self.entry.data.get(CONF_USER_ID)
 
         headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
         if token:
@@ -173,6 +172,35 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
         try:
             async with self._session.post(url, json=(payload or None), headers=headers, timeout=25) as resp:
                 text = await resp.text()
+
+                # --- 401: refresh then retry once ---
+                if resp.status == 401:
+                    _LOGGER.warning("SmartFilterPro status 401 Unauthorized. Forcing token refresh and retrying once.")
+                    await self._refresh_access_token()
+                    token2 = self._access_token()
+                    headers2 = {"Accept": "application/json", "Cache-Control": "no-cache"}
+                    if token2:
+                        headers2["Authorization"] = f"Bearer {token2}"
+                    async with self._session.post(url, json=(payload or None), headers=headers2, timeout=25) as r2:
+                        t2 = await r2.text()
+                        if r2.status >= 400:
+                            raise RuntimeError(f"Status retry POST {url} -> {r2.status} {t2[:500]}")
+                        data = await r2.json()
+                        body = data.get("response") if isinstance(data, dict) else data
+                        if not isinstance(body, dict):
+                            raise RuntimeError(f"Unexpected JSON shape: {body!r}")
+                        percent = _pick(body, K_PERCENT, *FALLBACK_KEYS[K_PERCENT])
+                        today   = _pick(body, K_TODAY,   *FALLBACK_KEYS[K_TODAY])
+                        total   = _pick(body, K_TOTAL,   *FALLBACK_KEYS[K_TOTAL])
+                        device_name = _pick(body, "device_name", "thermostat_name", "name")
+                        return {
+                            K_PERCENT: percent,
+                            K_TODAY: today,
+                            K_TOTAL: total,
+                            "device_name": device_name,
+                        }
+                # -----------------------------------
+
                 if resp.status >= 400:
                     raise RuntimeError(f"Status POST {url} -> {resp.status} {text[:500]}")
                 data = await resp.json()
