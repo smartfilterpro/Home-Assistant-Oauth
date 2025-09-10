@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import logging
 import json
-import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiohttp
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.event import async_track_state_change_event
@@ -21,10 +19,10 @@ from .const import (
     CONF_USER_ID, CONF_HVAC_ID, CONF_CLIMATE_ENTITY_ID,
     # posting
     CONF_API_BASE, CONF_POST_PATH,
-    # tokens / refresh
-    CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_EXPIRES_AT,
-    CONF_REFRESH_PATH, DEFAULT_REFRESH_PATH, TOKEN_SKEW_SECONDS,
+    # tokens
+    CONF_ACCESS_TOKEN,
 )
+from .auth import SfpAuth, is_bubble_soft_401
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,58 +45,17 @@ def _now_iso() -> str:
 
 
 async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Optional[str]:
-    """Ensure access token is valid; refresh if expired."""
-    data = entry.data or {}
-    access_token = data.get(CONF_ACCESS_TOKEN)
-    exp = data.get(CONF_EXPIRES_AT)
-    exp = int(exp) if exp is not None else None
-    now = int(time.time())
-
-    _LOGGER.debug("SFP token check: now=%s exp=%s skew=%s", now, exp, TOKEN_SKEW_SECONDS)
-
-    if exp is not None and now >= exp - TOKEN_SKEW_SECONDS:
-        rt = data.get(CONF_REFRESH_TOKEN)
-        if not rt:
-            _LOGGER.warning("SFP token appears expired, but no refresh_token present.")
-            return access_token
-
-        api_base = (data.get(CONF_API_BASE) or "").rstrip("/")
-        refresh_path = (data.get(CONF_REFRESH_PATH) or DEFAULT_REFRESH_PATH).strip("/")
-        url = f"{api_base}/{refresh_path}"
-        _LOGGER.info("SFP refreshing access token at %s", url)
-
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(url, json={"refresh_token": rt}, timeout=20) as resp:
-                    txt = await resp.text()
-                    _LOGGER.debug("SFP refresh response (%s): %s", resp.status, txt[:500])
-                    if resp.status >= 400:
-                        _LOGGER.error("SFP refresh failed %s -> %s %s", url, resp.status, txt[:300])
-                    else:
-                        js = json.loads(txt) if txt else {}
-                        body = js.get("response", js) if isinstance(js, dict) else {}
-                        at = body.get("access_token")
-                        new_rt = body.get("refresh_token", rt)
-                        new_exp = body.get("expires_at")
-                        if at and new_exp is not None:
-                            new_data = dict(data)
-                            new_data.update({
-                                CONF_ACCESS_TOKEN: at,
-                                CONF_REFRESH_TOKEN: new_rt,
-                                CONF_EXPIRES_AT: int(new_exp),
-                            })
-                            hass.config_entries.async_update_entry(entry, data=new_data)
-                            _LOGGER.info("SFP token refresh succeeded; new expiry=%s", new_exp)
-                            access_token = at
-        except Exception as e:
-            _LOGGER.error("SFP token refresh error: %s", e)
-
-    final_token = (hass.config_entries.async_get_entry(entry.entry_id).data or {}).get(CONF_ACCESS_TOKEN, access_token)
-    if final_token:
-        _LOGGER.debug("SFP using access token (len=%s).", len(str(final_token)))
+    """Centralized check via SfpAuth; returns latest access token."""
+    auth = SfpAuth(hass, entry)
+    await auth.ensure_valid()
+    # fetch most recent token from config entry
+    updated = hass.config_entries.async_get_entry(entry.entry_id)
+    token = (updated.data if updated else entry.data).get(CONF_ACCESS_TOKEN)
+    if token:
+        _LOGGER.debug("SFP using access token (len=%s).", len(str(token)))
     else:
         _LOGGER.warning("SFP no access token available; requests will be unauthenticated.")
-    return final_token
+    return token
 
 
 def _build_payload(
@@ -170,23 +127,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             async with session.post(telemetry_url, json=payload, headers=headers, timeout=20) as resp:
                 txt = await resp.text()
 
-                # --- 401: refresh then retry once ---
-                if resp.status == 401:
-                    _LOGGER.warning("SFP POST 401 Unauthorized. Forcing token refresh and retrying once.")
+                # Treat true 401s and Bubble soft-401s the same
+                if resp.status == 401 or is_bubble_soft_401(txt):
+                    _LOGGER.warning(
+                        "SFP POST unauthorized (HTTP=%s, soft401=%s). Refreshing and retrying once.",
+                        resp.status, is_bubble_soft_401(txt),
+                    )
                     await _ensure_valid_token(hass, entry)
-                    token2 = (hass.config_entries.async_get_entry(entry.entry_id).data or {}).get(CONF_ACCESS_TOKEN)
+                    updated = hass.config_entries.async_get_entry(entry.entry_id)
+                    token2 = (updated.data if updated else entry.data).get(CONF_ACCESS_TOKEN)
                     headers2 = dict(headers)
                     if token2:
                         headers2["Authorization"] = f"Bearer {token2}"
                     async with session.post(telemetry_url, json=payload, headers=headers2, timeout=20) as r2:
                         t2 = await r2.text()
-                        if r2.status >= 400:
-                            _LOGGER.error("SFP POST retry failed %s -> %s %s | payload=%s",
-                                          telemetry_url, r2.status, t2[:500], payload)
+                        if r2.status >= 400 or is_bubble_soft_401(t2):
+                            _LOGGER.error(
+                                "SFP POST retry failed %s -> %s %s | payload=%s",
+                                telemetry_url, r2.status, t2[:500], payload
+                            )
                         else:
                             _LOGGER.debug("SFP POST retry OK (%s): %s", r2.status, t2[:300])
                     return
-                # -----------------------------------
 
                 if resp.status >= 400:
                     _LOGGER.error("SFP POST %s -> %s %s | payload=%s", telemetry_url, resp.status, txt[:500], payload)
