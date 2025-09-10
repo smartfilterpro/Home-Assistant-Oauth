@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import timedelta, datetime
+from datetime import timedelta
 from typing import Optional, Dict, Any, Iterable
 
 import aiohttp
@@ -22,6 +22,7 @@ from .const import (
     CONF_CLIMATE_ENTITY_ID,
     DEFAULT_REFRESH_PATH, TOKEN_SKEW_SECONDS,
 )
+from .auth import SfpAuth, is_bubble_soft_401
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
         self._session: aiohttp.ClientSession = async_get_clientsession(hass)
         super().__init__(hass, _LOGGER, name=f"{DOMAIN}_status", update_interval=timedelta(minutes=20))
 
-    # --- token helpers ---
+    # --- token helpers via SfpAuth ---
     def _access_token(self) -> Optional[str]:
         tok = self.entry.data.get(CONF_ACCESS_TOKEN) or self.entry.data.get("token") or self.entry.data.get("id_token")
         return tok
@@ -107,46 +108,21 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
         return int(v) if v is not None else None
 
     async def _ensure_valid_token(self) -> None:
-        exp = self._expires_at()
-        if exp is None:
-            return
-        if int(time.time()) < exp - TOKEN_SKEW_SECONDS:
-            return
-        await self._refresh_access_token()
+        auth = SfpAuth(self.hass, self.entry)
+        await auth.ensure_valid()
+        self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
 
     async def _refresh_access_token(self) -> None:
-        rt = self._refresh_token()
-        if not rt:
-            _LOGGER.warning("No refresh_token; cannot refresh access token.")
-            return
-
-        url = f"{self._api_base}/{self._refresh_path}"
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(url, json={"refresh_token": rt}, timeout=20) as r:
-                    text = await r.text()
-                    if r.status >= 400:
-                        _LOGGER.error("Refresh %s -> %s %s", url, r.status, text[:500])
-                        return
-                    data = json.loads(text)
-        except Exception as e:
-            _LOGGER.error("Refresh call failed: %s", e)
-            return
-
-        body = data.get("response", data) if isinstance(data, dict) else {}
-        at = _pick(body, "access_token", "token", "id_token")
-        new_rt = _pick(body, "refresh_token", "rtoken") or rt
-        exp = _pick(body, "expires_at")
-
-        if not at or exp is None:
-            _LOGGER.error("Refresh response missing access_token/expires_at: %s", body)
-            return
-
-        new_data = dict(self.entry.data)
-        new_data.update({"access_token": at, "refresh_token": new_rt, "expires_at": int(exp)})
-        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        # Force refresh regardless of skew check
+        auth = SfpAuth(self.hass, self.entry)
+        # simulate forced refresh by temporarily setting expiry
+        if auth.expires_at is not None:
+            new_data = dict(self.entry.data)
+            new_data[CONF_EXPIRES_AT] = int(time.time()) - 1
+            self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+            self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
+        await auth.ensure_valid()
         self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
-        _LOGGER.debug("Token refreshed; exp=%s", exp)
 
     # --- main poll ---
     async def _async_update_data(self) -> dict:
@@ -173,9 +149,12 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
             async with self._session.post(url, json=(payload or None), headers=headers, timeout=25) as resp:
                 text = await resp.text()
 
-                # --- 401: refresh then retry once ---
-                if resp.status == 401:
-                    _LOGGER.warning("SmartFilterPro status 401 Unauthorized. Forcing token refresh and retrying once.")
+                # Treat true 401s and Bubble soft-401s the same
+                if resp.status == 401 or is_bubble_soft_401(text):
+                    _LOGGER.warning(
+                        "SmartFilterPro status unauthorized (HTTP=%s, soft401=%s). Refreshing & retrying once.",
+                        resp.status, is_bubble_soft_401(text),
+                    )
                     await self._refresh_access_token()
                     token2 = self._access_token()
                     headers2 = {"Accept": "application/json", "Cache-Control": "no-cache"}
@@ -183,7 +162,7 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
                         headers2["Authorization"] = f"Bearer {token2}"
                     async with self._session.post(url, json=(payload or None), headers=headers2, timeout=25) as r2:
                         t2 = await r2.text()
-                        if r2.status >= 400:
+                        if r2.status >= 400 or is_bubble_soft_401(t2):
                             raise RuntimeError(f"Status retry POST {url} -> {r2.status} {t2[:500]}")
                         data = await r2.json()
                         body = data.get("response") if isinstance(data, dict) else data
@@ -199,7 +178,6 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
                             K_TOTAL: total,
                             "device_name": device_name,
                         }
-                # -----------------------------------
 
                 if resp.status >= 400:
                     raise RuntimeError(f"Status POST {url} -> {resp.status} {text[:500]}")
@@ -297,7 +275,7 @@ class SfpFieldSensor(CoordinatorEntity[SfpStatusCoordinator], SensorEntity):
         val = (self.coordinator.data or {}).get(self._key)
         if self._round_1 and isinstance(val, (int, float)):
             try:
-                return round(float(val), 1)  # change to 2 if you want 0.00
+                return round(float(val), 1)
             except Exception:
                 return val
         return val
