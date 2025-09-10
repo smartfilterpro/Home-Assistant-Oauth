@@ -16,6 +16,7 @@ from .const import (
     CONF_CLIMATE_ENTITY_ID,
     DEFAULT_RESET_PATH, DEFAULT_REFRESH_PATH, TOKEN_SKEW_SECONDS,
 )
+from .auth import SfpAuth, is_bubble_soft_401
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,40 +43,9 @@ def _normalize_hvac(val: Any) -> Optional[str]:
 
 
 async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Optional[str]:
-    """Return an access token, refreshing with the refresh_token if near expiry."""
-    exp = entry.data.get(CONF_EXPIRES_AT)
-    exp = int(exp) if exp is not None else None
-    if exp is not None and int(time.time()) >= exp - TOKEN_SKEW_SECONDS:
-        rt = entry.data.get(CONF_REFRESH_TOKEN)
-        if rt:
-            api_base = (entry.data.get(CONF_API_BASE) or "").rstrip("/")
-            refresh_path = (entry.data.get(CONF_REFRESH_PATH) or DEFAULT_REFRESH_PATH).strip("/")
-            url = f"{api_base}/{refresh_path}"
-            try:
-                async with async_get_clientsession(hass).post(
-                    url, json={"refresh_token": rt}, timeout=20
-                ) as r:
-                    text = await r.text()
-                    if r.status < 400:
-                        data = json.loads(text) if text else {}
-                        body = data.get("response", data) if isinstance(data, dict) else {}
-                        at = body.get("access_token")
-                        new_rt = body.get("refresh_token", rt)
-                        new_exp = body.get("expires_at")
-                        if at and new_exp is not None:
-                            new_data = dict(entry.data)
-                            new_data.update({
-                                "access_token": at,
-                                "refresh_token": new_rt,
-                                "expires_at": int(new_exp),
-                            })
-                            hass.config_entries.async_update_entry(entry, data=new_data)
-                            _LOGGER.debug("SFP reset: token refreshed; exp=%s", new_exp)
-                    else:
-                        _LOGGER.error("SFP reset: refresh %s -> %s %s", url, r.status, text[:500])
-            except Exception as e:
-                _LOGGER.error("SFP reset: refresh call failed: %s", e)
-
+    """Return an access token, refreshing with SfpAuth if near/at expiry."""
+    auth = SfpAuth(hass, entry)
+    await auth.ensure_valid()
     updated = hass.config_entries.async_get_entry(entry.entry_id)
     return (updated.data if updated else entry.data).get(CONF_ACCESS_TOKEN)
 
@@ -126,14 +96,17 @@ class SmartFilterProResetButton(ButtonEntity):
         )
 
     async def _post_reset(self, url: str, payload: dict, headers: dict) -> bool:
-        """POST reset, handle 401 by returning False so caller can refresh+retry."""
+        """POST reset, handle 401/soft-401 by returning False so caller can refresh+retry."""
         try:
             async with async_get_clientsession(self.hass).post(
                 url, json=payload, headers=headers, timeout=25
             ) as resp:
                 txt = await resp.text()
-                if resp.status == 401:
-                    _LOGGER.warning("SFP reset: 401 (will try a token refresh). Response: %s", txt[:500])
+                if resp.status == 401 or is_bubble_soft_401(txt):
+                    _LOGGER.warning(
+                        "SFP reset: unauthorized (HTTP=%s, soft401=%s). Will try a token refresh.",
+                        resp.status, is_bubble_soft_401(txt),
+                    )
                     return False
                 if resp.status >= 400:
                     _LOGGER.error("SFP reset: POST %s -> %s %s | payload=%s", url, resp.status, txt[:500], payload)
@@ -166,7 +139,7 @@ class SmartFilterProResetButton(ButtonEntity):
         _LOGGER.debug("SFP reset: POST %s payload=%s", url, payload)
         ok = await self._post_reset(url, payload, headers)
 
-        # 2) if 401, refresh token and retry once
+        # 2) if unauthorized, refresh token and retry once
         if not ok:
             token = await _ensure_valid_token(self.hass, self.entry)  # will refresh if needed
             headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
