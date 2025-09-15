@@ -1,3 +1,4 @@
+# custom_components/smartfilterpro/__init__.py
 from __future__ import annotations
 
 import logging
@@ -26,7 +27,12 @@ from .auth import SfpAuth, is_bubble_soft_401
 
 _LOGGER = logging.getLogger(__name__)
 
+# Consider these hvac_action values to be "active"
 ACTIVE_ACTIONS = {"heating", "cooling", "fan"}
+
+# Consider these fan modes to be actively moving air even if hvac_action is "idle"
+FAN_ACTIVE_MODES = {"on", "on_high", "circulate"}
+
 ENTRY_VERSION = 2
 
 
@@ -42,6 +48,29 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _attrs_is_active(attrs: dict) -> bool:
+    """
+    Determine whether the system should be treated as 'active' (moving air).
+    Active if hvac_action is in ACTIVE_ACTIONS OR if hvac_action is idle/unknown
+    but the fan_mode indicates active circulation.
+    """
+    hvac_action = (attrs or {}).get("hvac_action")
+    if hvac_action in ACTIVE_ACTIONS:
+        return True
+
+    # Some climate integrations keep hvac_action='idle' during fan-only and expose fan activity via fan_mode.
+    fan_mode = (attrs or {}).get("fan_mode")
+    try:
+        fm = str(fan_mode).strip().lower() if fan_mode is not None else None
+    except Exception:
+        fm = None
+
+    if hvac_action in (None, "idle") and fm in FAN_ACTIVE_MODES:
+        return True
+
+    return False
 
 
 async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Optional[str]:
@@ -72,7 +101,7 @@ def _build_payload(
     """Original Bubble payload shape (what your backend expects)."""
     attrs = state.attributes if state else {}
     hvac_action = attrs.get("hvac_action")
-    is_active = hvac_action in ACTIVE_ACTIONS
+    is_active = _attrs_is_active(attrs)
     return {
         "user_id": user_id,
         "hvac_id": hvac_id,
@@ -115,7 +144,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     telemetry_url = f"{api_base}/{post_path}"
     session = async_get_clientsession(hass)
 
-    run_state = {"active_since": None, "last_action": None}
+    # Track current active state and when a cycle began
+    run_state = {
+        "active_since": None,   # datetime | None
+        "last_action": None,    # last hvac_action string for reference/logs
+        "is_active": False,     # last computed active boolean (based on hvac_action + fan_mode)
+    }
 
     async def _post(payload: dict) -> None:
         token = await _ensure_valid_token(hass, entry)
@@ -159,10 +193,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     async def _handle_state(new_state) -> None:
         """Send payload on every climate state change; mark cycle start/stop."""
-        hvac_action = (new_state.attributes or {}).get("hvac_action")
-        last = run_state["last_action"]
-        was_active = last in ACTIVE_ACTIONS
-        is_active = hvac_action in ACTIVE_ACTIONS
+        attrs = (new_state.attributes or {})
+        hvac_action = attrs.get("hvac_action")
+        is_active = _attrs_is_active(attrs)
+        was_active = bool(run_state.get("is_active"))
 
         payload = None
         now = datetime.now(timezone.utc)
@@ -178,7 +212,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
                 device_name=new_state.name,
             )
-            _LOGGER.debug("SFP cycle start detected: %s", hvac_action)
+            _LOGGER.debug("SFP cycle start detected: action=%s fan_mode=%s", hvac_action, attrs.get("fan_mode"))
 
         elif was_active and not is_active:
             # cycle end
@@ -196,7 +230,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 device_name=new_state.name,
             )
             run_state["active_since"] = None
-            _LOGGER.debug("SFP cycle end detected; duration=%ss", secs)
+            _LOGGER.debug(
+                "SFP cycle end detected; duration=%ss (action=%s fan_mode=%s)",
+                secs, hvac_action, attrs.get("fan_mode")
+            )
 
         else:
             # steady-state ping
@@ -209,7 +246,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 device_name=new_state.name,
             )
 
+        # Update last seen values
         run_state["last_action"] = hvac_action
+        run_state["is_active"] = is_active
+
         if payload:
             await _post(payload)
 
@@ -228,8 +268,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         # Prime an initial send
         st = hass.states.get(climate_eid)
         if st:
-            run_state["last_action"] = st.attributes.get("hvac_action")
-            if run_state["active_since"] is None and run_state["last_action"] in ACTIVE_ACTIONS:
+            attrs = st.attributes or {}
+            run_state["last_action"] = attrs.get("hvac_action")
+            current_active = _attrs_is_active(attrs)
+            run_state["is_active"] = current_active
+            if run_state["active_since"] is None and current_active:
+                # Note: if HA/integration just started mid-cycle, we don't know the true start time.
+                # This seeds active_since to now, consistent with previous behavior.
                 run_state["active_since"] = datetime.now(timezone.utc)
             await _handle_state(st)
     else:
