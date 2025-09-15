@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -11,6 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
+from homeassistant.helpers import entity_registry as er, device_registry as dr
 
 from .const import (
     DOMAIN,
@@ -30,7 +30,7 @@ _LOGGER = logging.getLogger(__name__)
 # Consider these hvac_action values to be "active"
 ACTIVE_ACTIONS = {"heating", "cooling", "fan"}
 
-# Consider these fan modes to be actively moving air even if hvac_action is "idle"
+# Fan modes that indicate air is moving even if hvac_action is "idle"
 FAN_ACTIVE_MODES = {"on", "on_high", "circulate"}
 
 ENTRY_VERSION = 2
@@ -60,12 +60,8 @@ def _attrs_is_active(attrs: dict) -> bool:
     if hvac_action in ACTIVE_ACTIONS:
         return True
 
-    # Some climate integrations keep hvac_action='idle' during fan-only and expose fan activity via fan_mode.
     fan_mode = (attrs or {}).get("fan_mode")
-    try:
-        fm = str(fan_mode).strip().lower() if fan_mode is not None else None
-    except Exception:
-        fm = None
+    fm = str(fan_mode).strip().lower() if fan_mode is not None else None
 
     if hvac_action in (None, "idle") and fm in FAN_ACTIVE_MODES:
         return True
@@ -92,13 +88,16 @@ def _build_payload(
     user_id: str,
     hvac_id: str,
     entity_id: str,
+    *,
     runtime_seconds: Optional[int] = None,
     cycle_start: Optional[str] = None,
     cycle_end: Optional[str] = None,
     connected: bool = False,
     device_name: Optional[str] = None,
+    thermostat_manufacturer: Optional[str] = None,
+    thermostat_model: Optional[str] = None,
 ) -> dict:
-    """Original Bubble payload shape (what your backend expects)."""
+    """Payload shape expected by your backend (Bubble)."""
     attrs = state.attributes if state else {}
     hvac_action = attrs.get("hvac_action")
     is_active = _attrs_is_active(attrs)
@@ -120,6 +119,9 @@ def _build_payload(
         "cycle_end_ts": cycle_end,            # ISO string or None
         "connected": bool(connected),
         "device_name": device_name,
+        # NEW: pass through thermostat hardware identity from HA's device registry
+        "thermostat_manufacturer": thermostat_manufacturer,
+        "thermostat_model": thermostat_model,
         "raw": attrs,
     }
 
@@ -143,6 +145,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     telemetry_url = f"{api_base}/{post_path}"
     session = async_get_clientsession(hass)
+
+    # Pull thermostat manufacturer/model from HA's device registry (if we have a climate entity)
+    device_meta = {"manufacturer": None, "model": None}
+    if climate_eid:
+        try:
+            ent_reg = er.async_get(hass)
+            dev_reg = dr.async_get(hass)
+            ent = ent_reg.async_get(climate_eid)
+            if ent and ent.device_id:
+                dev = dev_reg.async_get(ent.device_id)
+                if dev:
+                    device_meta["manufacturer"] = dev.manufacturer or None
+                    device_meta["model"] = dev.model or None
+                    _LOGGER.debug(
+                        "SFP device meta for %s -> manufacturer=%s model=%s",
+                        climate_eid, device_meta["manufacturer"], device_meta["model"]
+                    )
+        except Exception as e:
+            _LOGGER.debug("SFP device meta lookup failed: %s", e)
 
     # Track current active state and when a cycle began
     run_state = {
@@ -201,6 +222,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         payload = None
         now = datetime.now(timezone.utc)
 
+        common_kwargs = dict(
+            thermostat_manufacturer=device_meta.get("manufacturer"),
+            thermostat_model=device_meta.get("model"),
+            connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
+            device_name=new_state.name,
+        )
+
         if not was_active and is_active:
             # cycle start
             run_state["active_since"] = now
@@ -209,8 +237,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 user_id=user_id,
                 hvac_id=hvac_id,
                 entity_id=new_state.entity_id,
-                connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
-                device_name=new_state.name,
+                **common_kwargs,
             )
             _LOGGER.debug("SFP cycle start detected: action=%s fan_mode=%s", hvac_action, attrs.get("fan_mode"))
 
@@ -226,8 +253,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 runtime_seconds=secs,
                 cycle_start=start.isoformat() if start else None,
                 cycle_end=now.isoformat(),
-                connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
-                device_name=new_state.name,
+                **common_kwargs,
             )
             run_state["active_since"] = None
             _LOGGER.debug(
@@ -242,8 +268,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 user_id=user_id,
                 hvac_id=hvac_id,
                 entity_id=new_state.entity_id,
-                connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
-                device_name=new_state.name,
+                **common_kwargs,
             )
 
         # Update last seen values
@@ -294,6 +319,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     entity_id=climate_eid,
                     connected=s.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
                     device_name=s.name,
+                    thermostat_manufacturer=device_meta.get("manufacturer"),
+                    thermostat_model=device_meta.get("model"),
                 )
             )
 
