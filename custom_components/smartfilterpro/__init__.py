@@ -69,6 +69,26 @@ def _attrs_is_active(attrs: dict) -> bool:
     return False
 
 
+def _classify_mode(attrs: dict) -> str:
+    """
+    Return one of: 'heating', 'cooling', 'fanonly', 'idle'
+    """
+    hvac_action = (attrs or {}).get("hvac_action")
+    fan_mode = (attrs or {}).get("fan_mode")
+    fm = str(fan_mode).strip().lower() if fan_mode is not None else None
+
+    if hvac_action == "heating":
+        return "heating"
+    if hvac_action == "cooling":
+        return "cooling"
+    if hvac_action == "fan":
+        return "fanonly"
+    # If idle but fan is actively circulating, treat as fan-only airflow
+    if hvac_action in (None, "idle") and fm in FAN_ACTIVE_MODES:
+        return "fanonly"
+    return "idle"
+
+
 async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Optional[str]:
     """Centralized check via SfpAuth; returns latest access token."""
     auth = SfpAuth(hass, entry)
@@ -96,11 +116,21 @@ def _build_payload(
     device_name: Optional[str] = None,
     thermostat_manufacturer: Optional[str] = None,
     thermostat_model: Optional[str] = None,
+    # NEW: last-mode fields + reachability
+    last_mode: Optional[str] = None,
+    is_reachable: Optional[bool] = None,
 ) -> dict:
     """Payload shape expected by your backend (Bubble)."""
     attrs = state.attributes if state else {}
     hvac_action = attrs.get("hvac_action")
     is_active = _attrs_is_active(attrs)
+
+    # Normalize last_mode into the booleans you expect
+    lm = (last_mode or "").strip().lower() if last_mode else None
+    last_is_heating = lm == "heating"
+    last_is_cooling = lm == "cooling"
+    last_is_fanonly = lm == "fanonly"
+
     return {
         "user_id": user_id,
         "hvac_id": hvac_id,
@@ -122,6 +152,14 @@ def _build_payload(
         # NEW: pass through thermostat hardware identity from HA's device registry
         "thermostat_manufacturer": thermostat_manufacturer,
         "thermostat_model": thermostat_model,
+        # NEW: last-mode & equipment fields
+        "lastMode": lm,
+        "lastIsHeating": last_is_heating,
+        "lastIsCooling": last_is_cooling,
+        "lastIsFanOnly": last_is_fanonly,
+        "lastEquipmentStatus": lm,   # mirrors lastMode per requirement
+        "isReachable": bool(is_reachable if is_reachable is not None else connected),
+        # Raw attributes for debugging
         "raw": attrs,
     }
 
@@ -167,9 +205,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     # Track current active state and when a cycle began
     run_state = {
-        "active_since": None,   # datetime | None
-        "last_action": None,    # last hvac_action string for reference/logs
-        "is_active": False,     # last computed active boolean (based on hvac_action + fan_mode)
+        "active_since": None,        # datetime | None
+        "last_action": None,         # last hvac_action (may be 'idle')
+        "is_active": False,          # last computed active boolean (based on hvac_action + fan_mode)
+        "last_active_mode": None,    # 'heating' | 'cooling' | 'fanonly' | None  (only when actively moving air)
     }
 
     async def _post(payload: dict) -> None:
@@ -216,8 +255,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         """Send payload on every climate state change; mark cycle start/stop."""
         attrs = (new_state.attributes or {})
         hvac_action = attrs.get("hvac_action")
+        classified_mode = _classify_mode(attrs)  # 'heating' | 'cooling' | 'fanonly' | 'idle'
         is_active = _attrs_is_active(attrs)
         was_active = bool(run_state.get("is_active"))
+
+        # Maintain last_active_mode so we can report lastMode even while idle
+        if classified_mode in ("heating", "cooling", "fanonly"):
+            run_state["last_active_mode"] = classified_mode
 
         payload = None
         now = datetime.now(timezone.utc)
@@ -227,6 +271,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             thermostat_model=device_meta.get("model"),
             connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
             device_name=new_state.name,
+            last_mode=run_state.get("last_active_mode") if classified_mode == "idle" else classified_mode,
+            is_reachable=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
         )
 
         if not was_active and is_active:
@@ -239,12 +285,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 entity_id=new_state.entity_id,
                 **common_kwargs,
             )
-            _LOGGER.debug("SFP cycle start detected: action=%s fan_mode=%s", hvac_action, attrs.get("fan_mode"))
+            _LOGGER.debug(
+                "SFP cycle start detected: action=%s fan_mode=%s classified=%s",
+                hvac_action, attrs.get("fan_mode"), classified_mode
+            )
 
         elif was_active and not is_active:
             # cycle end
             start = run_state.get("active_since")
             secs = int((now - start).total_seconds()) if start else 0
+            # For cycle-end, lastMode should reflect the *last active* mode
+            lm = run_state.get("last_active_mode") or (
+                classified_mode if classified_mode in ("heating", "cooling", "fanonly") else None
+            )
             payload = _build_payload(
                 new_state,
                 user_id=user_id,
@@ -253,12 +306,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 runtime_seconds=secs,
                 cycle_start=start.isoformat() if start else None,
                 cycle_end=now.isoformat(),
-                **common_kwargs,
+                last_mode=lm,
+                is_reachable=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
+                thermostat_manufacturer=device_meta.get("manufacturer"),
+                thermostat_model=device_meta.get("model"),
+                connected=new_state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
+                device_name=new_state.name,
             )
             run_state["active_since"] = None
             _LOGGER.debug(
-                "SFP cycle end detected; duration=%ss (action=%s fan_mode=%s)",
-                secs, hvac_action, attrs.get("fan_mode")
+                "SFP cycle end detected; duration=%ss (action=%s fan_mode=%s lastMode=%s)",
+                secs, hvac_action, attrs.get("fan_mode"), lm
             )
 
         else:
@@ -294,12 +352,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         st = hass.states.get(climate_eid)
         if st:
             attrs = st.attributes or {}
+            classified_mode = _classify_mode(attrs)
+            if classified_mode in ("heating", "cooling", "fanonly"):
+                # Seed last_active_mode if we started mid-cycle
+                run_state["last_active_mode"] = classified_mode
             run_state["last_action"] = attrs.get("hvac_action")
             current_active = _attrs_is_active(attrs)
             run_state["is_active"] = current_active
             if run_state["active_since"] is None and current_active:
-                # Note: if HA/integration just started mid-cycle, we don't know the true start time.
-                # This seeds active_since to now, consistent with previous behavior.
+                # If HA/integration just started mid-cycle, true start is unknown; seed to now.
                 run_state["active_since"] = datetime.now(timezone.utc)
             await _handle_state(st)
     else:
@@ -311,6 +372,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             return
         s = hass.states.get(climate_eid)
         if s:
+            attrs = s.attributes or {}
+            classified_mode = _classify_mode(attrs)
+            lm = (run_state.get("last_active_mode")
+                  if classified_mode == "idle"
+                  else classified_mode if classified_mode in ("heating", "cooling", "fanonly") else None)
             await _post(
                 _build_payload(
                     s,
@@ -321,6 +387,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     device_name=s.name,
                     thermostat_manufacturer=device_meta.get("manufacturer"),
                     thermostat_model=device_meta.get("model"),
+                    last_mode=lm,
+                    is_reachable=s.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE),
                 )
             )
 
