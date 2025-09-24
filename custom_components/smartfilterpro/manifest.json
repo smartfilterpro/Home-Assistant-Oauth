@@ -10,5 +10,6 @@
   "iot_class": "cloud_polling",
   "integration_type": "service",
   "loggers": ["custom_components.smartfilterpro"],
-  "dependencies": ["application_credentials"]
+  "dependencies": ["application_credentials"],
+  "after_dependencies": ["http"]
 }
