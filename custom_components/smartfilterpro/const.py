@@ -12,8 +12,6 @@ CONF_USER_ID = "user_id"
 CONF_HVAC_ID = "hvac_id"            # selected HVAC id (we also send in body as hvac_uid)
 CONF_HVAC_UID = "hvac_uid"          # canonical unique id if/when you have it
 
-
-
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 
@@ -28,9 +26,7 @@ CONF_REFRESH_PATH = "refresh_path"
 CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_EXPIRES_AT = "expires_at"      # epoch seconds (UTC)
-# add to your existing constants
 CONF_CLIMATE_ENTITY_ID = "climate_entity_id"
-
 
 # ==== Defaults (update base or version when you flip from test→live) ====
 DEFAULT_API_BASE = "https://smartfilterpro-scaling.bubbleapps.io"
@@ -43,3 +39,7 @@ DEFAULT_REFRESH_PATH = "version-test/api/1.1/wf/ha_refresh_token"
 
 # Refresh 5 minutes before expiry to avoid clock skew
 TOKEN_SKEW_SECONDS = 300
+
+# Runtime calculation constants
+MAX_RUNTIME_SECONDS = 86400  # 24 hours maximum reasonable runtime
+RUNTIME_PERSIST_WINDOW = 3600  # 1 hour - restore active cycles within this window after restart
