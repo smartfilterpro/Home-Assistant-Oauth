@@ -80,15 +80,10 @@ def _climate_entity_ids(hass: HomeAssistant) -> list[str]:
         return []
 
 
+# User-facing login schema (simple - just email/password)
 STEP_LOGIN_SCHEMA = vol.Schema({
     vol.Required(CONF_EMAIL): str,
     vol.Required(CONF_PASSWORD): str,
-    vol.Optional(CONF_API_BASE, default=DEFAULT_API_BASE): str,
-    vol.Optional(CONF_LOGIN_PATH, default=DEFAULT_LOGIN_PATH): str,
-    vol.Optional(CONF_POST_PATH, default=DEFAULT_POST_PATH): str,
-    vol.Optional(CONF_RESET_PATH, default=DEFAULT_RESET_PATH): str,
-    vol.Optional(CONF_REFRESH_PATH, default=DEFAULT_REFRESH_PATH): str,
-    vol.Optional(CONF_STATUS_URL, default=DEFAULT_STATUS_URL): str,  # can override absolute status URL
 })
 
 
@@ -112,12 +107,13 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         email = user_input[CONF_EMAIL].strip()
         password = user_input[CONF_PASSWORD]
 
-        api_base = user_input.get(CONF_API_BASE, DEFAULT_API_BASE).rstrip("/")
-        login_path = user_input.get(CONF_LOGIN_PATH, DEFAULT_LOGIN_PATH).strip("/")
-        post_path = user_input.get(CONF_POST_PATH, DEFAULT_POST_PATH).strip("/")
-        reset_path = user_input.get(CONF_RESET_PATH, DEFAULT_RESET_PATH).strip("/")
-        refresh_path = user_input.get(CONF_REFRESH_PATH, DEFAULT_REFRESH_PATH).strip("/")
-        override_status_url = user_input.get(CONF_STATUS_URL)
+        # Use defaults for all endpoints (not shown in UI)
+        api_base = DEFAULT_API_BASE.rstrip("/")
+        login_path = DEFAULT_LOGIN_PATH.strip("/")
+        post_path = DEFAULT_POST_PATH.strip("/")
+        reset_path = DEFAULT_RESET_PATH.strip("/")
+        refresh_path = DEFAULT_REFRESH_PATH.strip("/")
+        status_url = DEFAULT_STATUS_URL.strip("/")
 
         login_url = f"{api_base}/{login_path}"
 
@@ -192,7 +188,7 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_POST_PATH: post_path,
             CONF_RESET_PATH: reset_path,
             CONF_REFRESH_PATH: refresh_path,
-            CONF_STATUS_URL: (override_status_url.strip() if override_status_url else None),
+            CONF_STATUS_URL: status_url,
             CONF_ACCESS_TOKEN: access_token,
             CONF_REFRESH_TOKEN: refresh_token,
             CONF_EXPIRES_AT: expires_at,
@@ -231,8 +227,7 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def _resolve_and_prepare(self, hvac_id: Optional[str]) -> FlowResult:
         api_base = self._login_ctx[CONF_API_BASE]
         user_id = self._login_ctx[CONF_USER_ID]
-
-        status_url = self._login_ctx.get(CONF_STATUS_URL) or f"{api_base.rstrip('/')}/{DEFAULT_STATUS_URL.strip('/')}"
+        status_url = f"{api_base}/{self._login_ctx[CONF_STATUS_URL]}"
         bubble_name = self._hvac_name_by_id.get(str(hvac_id)) if hvac_id else None
 
         self._pending_entry_data = {
