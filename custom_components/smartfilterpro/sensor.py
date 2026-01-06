@@ -26,19 +26,20 @@ from .auth import SfpAuth, is_bubble_soft_401
 
 _LOGGER = logging.getLogger(__name__)
 
-K_PERCENT = "percentage_used"
-K_TODAY   = "today_minutes"
-K_TOTAL   = "total_minutes"
+# Keys matching new Bubble response format
+K_FILTER_HEALTH = "filter_health"
+K_MINUTES_ACTIVE = "minutes_active"
+K_LAST_UPDATED = "last_updated"
 
 # Fallback keys to handle different Bubble response formats
 FALLBACK_KEYS = {
-    K_PERCENT: ("percentage", "percent_used", "percentage used", "filterHelath", "filterHealth", "filter_health"),
-    K_TODAY:   ("today", "todays_minutes", "2.0.1_Daily Active Time Sum", "todayMinutes", "today_minutes"),
-    K_TOTAL:   ("total", "total_runtime", "1.0.1_Minutes active", "minutesActive", "minutes_active"),
+    K_FILTER_HEALTH: ("filterHelath", "filterHealth", "filter_health", "percentage", "percent"),
+    K_MINUTES_ACTIVE: ("minutesActive", "minutes_active", "total_runtime", "total_minutes", "1.0.1_Minutes active"),
+    K_LAST_UPDATED: ("lastUpdated", "last_updated", "updated_at"),
 }
 
 # Fallback keys for device name
-DEVICE_NAME_KEYS = ("device_name", "deviceName", "thermostat_name", "name")
+DEVICE_NAME_KEYS = ("deviceName", "device_name", "thermostat_name", "name")
 
 def _pick(obj: Dict, *keys):
     for k in keys:
@@ -46,27 +47,6 @@ def _pick(obj: Dict, *keys):
             return obj[k]
     return None
 
-
-def _get_percentage_used(body: Dict) -> Optional[float]:
-    """
-    Get percentage used from response.
-    Handles conversion if Bubble returns filterHealth (100 = healthy)
-    instead of percentage_used (100 = fully used).
-    """
-    # First try direct percentage_used fields
-    val = _pick(body, "percentage_used", "percentage", "percent_used", "percentage used")
-    if val is not None:
-        return val
-
-    # If filterHealth is returned, convert: percentage_used = 100 - filterHealth
-    filter_health = _pick(body, "filterHelath", "filterHealth", "filter_health")
-    if filter_health is not None:
-        try:
-            return 100 - float(filter_health)
-        except (ValueError, TypeError):
-            return filter_health
-
-    return None
 
 def _normalize_hvac(val: Any) -> Optional[str]:
     if val is None:
@@ -194,14 +174,14 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
                         body = data.get("response") if isinstance(data, dict) else data
                         if not isinstance(body, dict):
                             raise RuntimeError(f"Unexpected JSON shape: {body!r}")
-                        percent = _get_percentage_used(body)
-                        today   = _pick(body, K_TODAY,   *FALLBACK_KEYS[K_TODAY])
-                        total   = _pick(body, K_TOTAL,   *FALLBACK_KEYS[K_TOTAL])
+                        filter_health = _pick(body, *FALLBACK_KEYS[K_FILTER_HEALTH])
+                        minutes_active = _pick(body, *FALLBACK_KEYS[K_MINUTES_ACTIVE])
+                        last_updated = _pick(body, *FALLBACK_KEYS[K_LAST_UPDATED])
                         device_name = _pick(body, *DEVICE_NAME_KEYS)
                         return {
-                            K_PERCENT: percent,
-                            K_TODAY: today,
-                            K_TOTAL: total,
+                            K_FILTER_HEALTH: filter_health,
+                            K_MINUTES_ACTIVE: minutes_active,
+                            K_LAST_UPDATED: last_updated,
                             "device_name": device_name,
                         }
 
@@ -217,16 +197,16 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
             raise RuntimeError(f"Unexpected JSON shape: {body!r}")
 
         # pull values (telemetry + device_name)
-        percent = _get_percentage_used(body)
-        today   = _pick(body, K_TODAY,   *FALLBACK_KEYS[K_TODAY])
-        total   = _pick(body, K_TOTAL,   *FALLBACK_KEYS[K_TOTAL])
+        filter_health = _pick(body, *FALLBACK_KEYS[K_FILTER_HEALTH])
+        minutes_active = _pick(body, *FALLBACK_KEYS[K_MINUTES_ACTIVE])
+        last_updated = _pick(body, *FALLBACK_KEYS[K_LAST_UPDATED])
         device_name = _pick(body, *DEVICE_NAME_KEYS)
 
         # Expose device_name so entities can use it for device_info
         return {
-            K_PERCENT: percent,
-            K_TODAY: today,
-            K_TOTAL: total,
+            K_FILTER_HEALTH: filter_health,
+            K_MINUTES_ACTIVE: minutes_active,
+            K_LAST_UPDATED: last_updated,
             "device_name": device_name,
         }
 
@@ -243,12 +223,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     suffix = f"{entry.entry_id}_{hvac}"
 
     entities = [
-        SfpFieldSensor(coord, K_PERCENT, "SmartFilterPro Percentage Used", "%", True,
-                       unique_id=f"{DOMAIN}_{suffix}_percentage_used"),
-        SfpFieldSensor(coord, K_TODAY,   "SmartFilterPro Today's Usage",   "min", False,
-                       unique_id=f"{DOMAIN}_{suffix}_todays_usage"),
-        SfpFieldSensor(coord, K_TOTAL,   "SmartFilterPro Total Minutes",   "min", False,
-                       unique_id=f"{DOMAIN}_{suffix}_total_minutes"),
+        SfpFieldSensor(coord, K_FILTER_HEALTH, "SmartFilterPro Filter Health", "%", True,
+                       unique_id=f"{DOMAIN}_{suffix}_filter_health"),
+        SfpFieldSensor(coord, K_MINUTES_ACTIVE, "SmartFilterPro Minutes Active", "min", True,
+                       unique_id=f"{DOMAIN}_{suffix}_minutes_active"),
+        SfpFieldSensor(coord, K_LAST_UPDATED, "SmartFilterPro Last Updated", None, False,
+                       unique_id=f"{DOMAIN}_{suffix}_last_updated"),
     ]
     async_add_entities(entities)
 
@@ -262,11 +242,15 @@ class SfpFieldSensor(CoordinatorEntity[SfpStatusCoordinator], SensorEntity):
         self._round_1 = round_1
 
         # Optional: state_class & device_class
-        self._attr_state_class = "measurement"
-        if field_key in ("today_minutes", "total_minutes"):
-            self._attr_device_class = "duration"
-        elif field_key == "percentage_used":
+        if field_key == K_FILTER_HEALTH:
+            self._attr_state_class = "measurement"
             self._attr_device_class = "power_factor"
+        elif field_key == K_MINUTES_ACTIVE:
+            self._attr_state_class = "measurement"
+            self._attr_device_class = "duration"
+        elif field_key == K_LAST_UPDATED:
+            # Last updated is a date string, no state_class or device_class
+            self._attr_state_class = None
 
     @property
     def device_info(self):
