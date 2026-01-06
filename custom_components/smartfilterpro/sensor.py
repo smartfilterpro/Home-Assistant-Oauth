@@ -171,7 +171,8 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
                         if r2.status >= 400 or is_bubble_soft_401(t2):
                             raise RuntimeError(f"Status retry POST {url} -> {r2.status} {t2[:500]}")
                         data = await r2.json()
-                        body = data.get("response") if isinstance(data, dict) else data
+                        # Handle both wrapped {"response": {...}} and unwrapped {...} formats
+                        body = data.get("response", data) if isinstance(data, dict) else data
                         if not isinstance(body, dict):
                             raise RuntimeError(f"Unexpected JSON shape: {body!r}")
                         filter_health = _pick(body, *FALLBACK_KEYS[K_FILTER_HEALTH])
@@ -192,7 +193,8 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
             _LOGGER.error("SmartFilterPro status fetch failed: %s", e)
             raise
 
-        body = data.get("response") if isinstance(data, dict) else data
+        # Handle both wrapped {"response": {...}} and unwrapped {...} formats
+        body = data.get("response", data) if isinstance(data, dict) else data
         if not isinstance(body, dict):
             raise RuntimeError(f"Unexpected JSON shape: {body!r}")
 
