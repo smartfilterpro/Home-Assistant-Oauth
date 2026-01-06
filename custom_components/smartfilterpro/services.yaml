@@ -1,0 +1,3 @@
+send_now:
+  name: Send Telemetry Now
+  description: Immediately send current thermostat telemetry to SmartFilterPro.
