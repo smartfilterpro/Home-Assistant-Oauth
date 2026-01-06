@@ -18,12 +18,12 @@ from .const import (
     CONF_USER_ID, CONF_HVAC_ID, CONF_HVAC_UID, CONF_CLIMATE_ENTITY_ID,
     # creds & endpoints
     CONF_EMAIL, CONF_PASSWORD,
-    CONF_API_BASE, CONF_LOGIN_PATH, CONF_POST_PATH, CONF_RESOLVER_PATH,
+    CONF_API_BASE, CONF_LOGIN_PATH, CONF_POST_PATH,
     CONF_RESET_PATH, CONF_STATUS_URL, CONF_REFRESH_PATH,
     # tokens
     CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_EXPIRES_AT,
     # defaults
-    DEFAULT_API_BASE, DEFAULT_LOGIN_PATH, DEFAULT_POST_PATH, DEFAULT_RESOLVER_PATH,
+    DEFAULT_API_BASE, DEFAULT_LOGIN_PATH, DEFAULT_POST_PATH,
     DEFAULT_RESET_PATH, DEFAULT_STATUS_URL, DEFAULT_REFRESH_PATH,
 )
 
@@ -86,7 +86,6 @@ STEP_LOGIN_SCHEMA = vol.Schema({
     vol.Optional(CONF_API_BASE, default=DEFAULT_API_BASE): str,
     vol.Optional(CONF_LOGIN_PATH, default=DEFAULT_LOGIN_PATH): str,
     vol.Optional(CONF_POST_PATH, default=DEFAULT_POST_PATH): str,
-    vol.Optional(CONF_RESOLVER_PATH, default=DEFAULT_RESOLVER_PATH): str,
     vol.Optional(CONF_RESET_PATH, default=DEFAULT_RESET_PATH): str,
     vol.Optional(CONF_REFRESH_PATH, default=DEFAULT_REFRESH_PATH): str,
     vol.Optional(CONF_STATUS_URL, default=DEFAULT_STATUS_URL): str,  # can override absolute status URL
@@ -116,7 +115,6 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         api_base = user_input.get(CONF_API_BASE, DEFAULT_API_BASE).rstrip("/")
         login_path = user_input.get(CONF_LOGIN_PATH, DEFAULT_LOGIN_PATH).strip("/")
         post_path = user_input.get(CONF_POST_PATH, DEFAULT_POST_PATH).strip("/")
-        resolver_path = user_input.get(CONF_RESOLVER_PATH, DEFAULT_RESOLVER_PATH).strip("/")
         reset_path = user_input.get(CONF_RESET_PATH, DEFAULT_RESET_PATH).strip("/")
         refresh_path = user_input.get(CONF_REFRESH_PATH, DEFAULT_REFRESH_PATH).strip("/")
         override_status_url = user_input.get(CONF_STATUS_URL)
@@ -192,7 +190,6 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_API_BASE: api_base,
             CONF_LOGIN_PATH: login_path,
             CONF_POST_PATH: post_path,
-            CONF_RESOLVER_PATH: resolver_path,
             CONF_RESET_PATH: reset_path,
             CONF_REFRESH_PATH: refresh_path,
             CONF_STATUS_URL: (override_status_url.strip() if override_status_url else None),
@@ -233,18 +230,7 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # ------------- Prepare entry; then optional HA climate selection -------------
     async def _resolve_and_prepare(self, hvac_id: Optional[str]) -> FlowResult:
         api_base = self._login_ctx[CONF_API_BASE]
-        resolver_path = self._login_ctx[CONF_RESOLVER_PATH]
         user_id = self._login_ctx[CONF_USER_ID]
-
-        # Optional resolver (non-fatal)
-        try:
-            if hvac_id:
-                resolver_url = f"{api_base}/{resolver_path}"
-                async with aiohttp.ClientSession() as s:
-                    async with s.post(resolver_url, json={"user_id": user_id, "hvac_id": hvac_id}, timeout=20) as r:
-                        _ = await r.text()
-        except Exception as e:
-            _LOGGER.debug("Resolver skipped/failed: %s", e)
 
         status_url = self._login_ctx.get(CONF_STATUS_URL) or f"{api_base.rstrip('/')}/{DEFAULT_STATUS_URL.strip('/')}"
         bubble_name = self._hvac_name_by_id.get(str(hvac_id)) if hvac_id else None
@@ -256,7 +242,6 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "hvac_name": bubble_name,                   # <-- keep Bubble-friendly name
             CONF_API_BASE: api_base,
             CONF_POST_PATH: self._login_ctx[CONF_POST_PATH],
-            CONF_RESOLVER_PATH: resolver_path,
             CONF_RESET_PATH: self._login_ctx[CONF_RESET_PATH],
             CONF_STATUS_URL: status_url,
             CONF_REFRESH_PATH: self._login_ctx[CONF_REFRESH_PATH],
