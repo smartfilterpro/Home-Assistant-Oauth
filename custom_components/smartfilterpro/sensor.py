@@ -30,16 +30,42 @@ K_PERCENT = "percentage_used"
 K_TODAY   = "today_minutes"
 K_TOTAL   = "total_minutes"
 
+# Fallback keys to handle different Bubble response formats
 FALLBACK_KEYS = {
-    K_PERCENT: ("percentage", "percent_used", "percentage used"),
-    K_TODAY:   ("today", "todays_minutes", "2.0.1_Daily Active Time Sum"),
-    K_TOTAL:   ("total", "total_runtime", "1.0.1_Minutes active"),
+    K_PERCENT: ("percentage", "percent_used", "percentage used", "filterHelath", "filterHealth", "filter_health"),
+    K_TODAY:   ("today", "todays_minutes", "2.0.1_Daily Active Time Sum", "todayMinutes", "today_minutes"),
+    K_TOTAL:   ("total", "total_runtime", "1.0.1_Minutes active", "minutesActive", "minutes_active"),
 }
+
+# Fallback keys for device name
+DEVICE_NAME_KEYS = ("device_name", "deviceName", "thermostat_name", "name")
 
 def _pick(obj: Dict, *keys):
     for k in keys:
         if k in obj and obj[k] is not None:
             return obj[k]
+    return None
+
+
+def _get_percentage_used(body: Dict) -> Optional[float]:
+    """
+    Get percentage used from response.
+    Handles conversion if Bubble returns filterHealth (100 = healthy)
+    instead of percentage_used (100 = fully used).
+    """
+    # First try direct percentage_used fields
+    val = _pick(body, "percentage_used", "percentage", "percent_used", "percentage used")
+    if val is not None:
+        return val
+
+    # If filterHealth is returned, convert: percentage_used = 100 - filterHealth
+    filter_health = _pick(body, "filterHelath", "filterHealth", "filter_health")
+    if filter_health is not None:
+        try:
+            return 100 - float(filter_health)
+        except (ValueError, TypeError):
+            return filter_health
+
     return None
 
 def _normalize_hvac(val: Any) -> Optional[str]:
@@ -168,10 +194,10 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
                         body = data.get("response") if isinstance(data, dict) else data
                         if not isinstance(body, dict):
                             raise RuntimeError(f"Unexpected JSON shape: {body!r}")
-                        percent = _pick(body, K_PERCENT, *FALLBACK_KEYS[K_PERCENT])
+                        percent = _get_percentage_used(body)
                         today   = _pick(body, K_TODAY,   *FALLBACK_KEYS[K_TODAY])
                         total   = _pick(body, K_TOTAL,   *FALLBACK_KEYS[K_TOTAL])
-                        device_name = _pick(body, "device_name", "thermostat_name", "name")
+                        device_name = _pick(body, *DEVICE_NAME_KEYS)
                         return {
                             K_PERCENT: percent,
                             K_TODAY: today,
@@ -191,10 +217,10 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
             raise RuntimeError(f"Unexpected JSON shape: {body!r}")
 
         # pull values (telemetry + device_name)
-        percent = _pick(body, K_PERCENT, *FALLBACK_KEYS[K_PERCENT])
+        percent = _get_percentage_used(body)
         today   = _pick(body, K_TODAY,   *FALLBACK_KEYS[K_TODAY])
         total   = _pick(body, K_TOTAL,   *FALLBACK_KEYS[K_TOTAL])
-        device_name = _pick(body, "device_name", "thermostat_name", "name")
+        device_name = _pick(body, *DEVICE_NAME_KEYS)
 
         # Expose device_name so entities can use it for device_info
         return {
