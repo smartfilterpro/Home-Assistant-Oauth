@@ -29,7 +29,7 @@ CONF_EXPIRES_AT = "expires_at"      # epoch seconds (UTC)
 CONF_CLIMATE_ENTITY_ID = "climate_entity_id"
 
 # ==== Defaults (update base or version when you flip from test→live) ====
-DEFAULT_API_BASE = "https://smartfilterpro-scaling.bubbleapps.io"
+DEFAULT_API_BASE = "https://smartfilterpro.com"
 DEFAULT_LOGIN_PATH = "version-test/api/1.1/wf/ha_password_login"
 DEFAULT_POST_PATH = "version-test/api/1.1/wf/ha_telemetry"
 DEFAULT_RESOLVER_PATH = "version-test/api/1.1/wf/ha_resolve_thermostat_obj"
