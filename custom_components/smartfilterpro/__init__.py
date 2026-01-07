@@ -53,6 +53,8 @@ class RuntimeTracker:
             "is_active": False,            # last computed active boolean
             "last_active_mode": None,      # 'heating' | 'cooling' | 'fanonly' | None
             "last_equipment_status": "Idle",  # 8-state system status
+            "last_post_time": None,        # datetime of last post (for debounce)
+            "last_post_status": None,      # equipment status of last post
         }
     
     async def load_state(self):
@@ -102,6 +104,33 @@ class RuntimeTracker:
             await self._store.async_save(data)
         except Exception as e:
             _LOGGER.warning("SFP: Failed to save runtime state: %s", e)
+
+    def should_skip_duplicate_post(self, equipment_status: str, event_type: str) -> bool:
+        """Check if this post should be skipped as a duplicate (debounce)."""
+        # Always allow Mode_Change events (cycle start/end with runtime)
+        if event_type == "Mode_Change":
+            return False
+
+        now = datetime.now(timezone.utc)
+        last_time = self.run_state.get("last_post_time")
+        last_status = self.run_state.get("last_post_status")
+
+        # Skip if same status posted within last 3 seconds
+        if last_time and last_status == equipment_status:
+            elapsed = (now - last_time).total_seconds()
+            if elapsed < 3.0:
+                _LOGGER.debug(
+                    "SFP: Skipping duplicate %s post (same status %s, %.1fs ago)",
+                    event_type, equipment_status, elapsed
+                )
+                return True
+
+        return False
+
+    def record_post(self, equipment_status: str):
+        """Record that a post was made (for debounce tracking)."""
+        self.run_state["last_post_time"] = datetime.now(timezone.utc)
+        self.run_state["last_post_status"] = equipment_status
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -592,7 +621,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await runtime_tracker.save_state()
 
         if payload:
+            event_type = payload.get("event_type", "Telemetry_Update")
+            # Debounce: skip duplicate Telemetry_Update posts within 3 seconds
+            if runtime_tracker.should_skip_duplicate_post(equipment_status, event_type):
+                return
+
             await _post(payload)
+            runtime_tracker.record_post(equipment_status)
 
     @callback
     async def _on_change(event):
