@@ -26,6 +26,10 @@ def is_bubble_soft_401(txt: str) -> bool:
 
     def _has_invalid(x) -> bool:
         if not isinstance(x, dict):
+            # Check if x is a JSON string that contains error info
+            if isinstance(x, str):
+                xl = x.lower()
+                return "invalid_token" in xl or ("access token" in xl and ("invalid" in xl or "expired" in xl))
             return False
         status = x.get("status") or x.get("status_code")
         if isinstance(status, str):
@@ -41,8 +45,11 @@ def is_bubble_soft_401(txt: str) -> bool:
 
     if _has_invalid(body):
         return True
-    if isinstance(body, dict) and _has_invalid(body.get("body", {})):
-        return True
+    # Check nested Body/body field (Bubble uses capital B)
+    if isinstance(body, dict):
+        nested = body.get("Body") or body.get("body")
+        if _has_invalid(nested):
+            return True
     return False
 
 
@@ -72,11 +79,12 @@ class SfpAuth:
             return
         await self._refresh()
 
-    async def _refresh(self) -> None:
+    async def _refresh(self) -> bool:
+        """Refresh tokens. Returns True on success, False on failure."""
         rt = self.refresh_token
         if not rt:
-            _LOGGER.warning("No refresh_token; cannot refresh.")
-            return
+            _LOGGER.warning("No refresh_token; cannot refresh. Please delete and re-add the integration.")
+            return False
         base = (self.entry.data.get(CONF_API_BASE) or "").rstrip("/")
         path = (self.entry.data.get(CONF_REFRESH_PATH) or DEFAULT_REFRESH_PATH).strip("/")
         url  = f"{base}/{path}"
@@ -85,13 +93,17 @@ class SfpAuth:
             async with aiohttp.ClientSession() as s:
                 async with s.post(url, json={"refresh_token": rt}, timeout=20) as r:
                     txt = await r.text()
-                    if r.status >= 400:
-                        _LOGGER.error("Refresh %s -> %s %s", url, r.status, txt[:400])
-                        return
+                    if r.status >= 400 or is_bubble_soft_401(txt):
+                        _LOGGER.error(
+                            "Token refresh failed (%s). Your session may have expired. "
+                            "Please delete and re-add the SmartFilterPro integration. Response: %s",
+                            r.status, txt[:400]
+                        )
+                        return False
                     data = json.loads(txt) if txt else {}
         except Exception as e:
             _LOGGER.error("Refresh call failed: %s", e)
-            return
+            return False
 
         body = data.get("response", data) if isinstance(data, dict) else {}
         at  = body.get("access_token")
@@ -99,8 +111,11 @@ class SfpAuth:
         new_rt = body.get("refresh_token", rt)
 
         if not at or exp is None:
-            _LOGGER.error("Refresh response missing access_token/expires_at: %s", body)
-            return
+            _LOGGER.error(
+                "Refresh response missing access_token/expires_at. "
+                "Please delete and re-add the SmartFilterPro integration. Response: %s", body
+            )
+            return False
 
         new_data = dict(self.entry.data)
         new_data.update({
@@ -112,6 +127,7 @@ class SfpAuth:
         # re-fetch entry so future reads see updated tokens
         self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
         _LOGGER.debug("Token refreshed; exp=%s", exp)
+        return True
 
     # ========== Core Token (for Railway Core Ingest) ==========
 
