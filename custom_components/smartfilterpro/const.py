@@ -8,7 +8,7 @@ STORAGE_VERSION = 1
 PLATFORMS = ["sensor", "button"]
 
 # ==== Railway Core Ingest URL (same for both Hubitat and HA) ====
-CORE_INGEST_URL = "https://core-ingest-ingest.up.railway.app/ingest/v1/events:batch"
+CORE_INGEST_URL = "https://core.smartfilterpro.com/ingest/v1/events:batch"
 
 # ==== Config entry keys ====
 CONF_USER_ID = "user_id"
@@ -37,12 +37,12 @@ CONF_CORE_TOKEN_EXP = "core_token_exp"  # epoch seconds (UTC)
 
 # ==== Defaults (update base or version when you flip from test→live) ====
 DEFAULT_API_BASE = "https://smartfilterpro.com"
-DEFAULT_LOGIN_PATH = "version-test/api/1.1/wf/ha_password_login"
-DEFAULT_POST_PATH = "version-test/api/1.1/wf/ha_telemetry"
-DEFAULT_RESET_PATH = "version-test/api/1.1/wf/ha_reset_filter"
-DEFAULT_STATUS_URL = "version-test/api/1.1/wf/ha_therm_status"
-DEFAULT_REFRESH_PATH = "version-test/api/1.1/wf/ha_refresh_token"
-DEFAULT_CORE_JWT_PATH = "version-test/api/1.1/wf/issue_core_token_ha"
+DEFAULT_LOGIN_PATH = "/api/1.1/wf/ha_password_login"
+DEFAULT_POST_PATH = "/api/1.1/wf/ha_telemetry"
+DEFAULT_RESET_PATH = "/api/1.1/wf/ha_reset_filter"
+DEFAULT_STATUS_URL = "/api/1.1/wf/ha_therm_status"
+DEFAULT_REFRESH_PATH = "/api/1.1/wf/ha_refresh_token"
+DEFAULT_CORE_JWT_PATH = "/api/1.1/wf/issue_core_token_ha"
 
 # Refresh 5 minutes before expiry to avoid clock skew
 TOKEN_SKEW_SECONDS = 300
