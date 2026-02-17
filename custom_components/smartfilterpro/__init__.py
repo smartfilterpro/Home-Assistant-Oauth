@@ -312,6 +312,7 @@ def _build_payload(
     is_reachable: Optional[bool] = None,
     event_type: Optional[str] = None,
     previous_status: Optional[str] = None,
+    runtime_type: Optional[str] = None,
 ) -> dict:
     """
     Payload shape expected by Railway Core (matches Hubitat 8-state format).
@@ -388,6 +389,7 @@ def _build_payload(
         "equipment_status": equipment_status,
         "is_active": is_active,
         "runtime_seconds": runtime_seconds,
+        "runtime_type": runtime_type,
         "previous_status": previous_status,
 
         # Timestamps
@@ -592,6 +594,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 device_name=new_state.name,
                 event_type="Mode_Change",
                 previous_status=previous_status,
+                runtime_type="END",
             )
             runtime_tracker.run_state["active_since"] = None
             _LOGGER.info(
@@ -599,8 +602,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 secs, secs / 60, equipment_status, previous_status
             )
 
+        elif equipment_status != previous_status and is_active:
+            # Active-to-active status change (e.g., Cooling → Heating)
+            # End the previous segment with runtime, then start a new one
+            start = runtime_tracker.run_state.get("active_since")
+            secs = _calculate_runtime_seconds(start, now) if start else None
+
+            # Send Mode_Change event to close the previous segment
+            end_payload = _build_payload(
+                new_state,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=new_state.entity_id,
+                runtime_seconds=secs,
+                cycle_start=start.isoformat() if start else None,
+                cycle_end=now.isoformat(),
+                event_type="Mode_Change",
+                runtime_type="END",
+                previous_status=previous_status,
+                **common_kwargs,
+            )
+
+            _LOGGER.info(
+                "SFP active status change: %s (%ss) → %s",
+                previous_status, secs, equipment_status
+            )
+
+            await _post(end_payload)
+            runtime_tracker.record_post(previous_status)
+
+            # Start a new segment for the new active state
+            runtime_tracker.run_state["active_since"] = now
+
+            # Send Telemetry_Update for the new state
+            payload = _build_payload(
+                new_state,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=new_state.entity_id,
+                event_type="Telemetry_Update",
+                **common_kwargs,
+            )
+
         else:
-            # steady-state ping (telemetry update)
+            # steady-state ping (telemetry update) — no status change
             payload = _build_payload(
                 new_state,
                 user_id=user_id,
