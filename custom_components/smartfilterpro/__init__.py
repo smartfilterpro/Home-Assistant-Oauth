@@ -301,6 +301,7 @@ def _build_payload(
     hvac_id: str,
     entity_id: str,
     *,
+    hvac_mode: Optional[str] = None,
     runtime_seconds: Optional[int] = None,
     cycle_start: Optional[str] = None,
     cycle_end: Optional[str] = None,
@@ -322,7 +323,7 @@ def _build_payload(
     ts = _now_iso()
 
     # Get 8-state equipment status
-    equipment_status = _classify_8_state(attrs, attrs.get("hvac_mode"))
+    equipment_status = _classify_8_state(attrs, hvac_mode)
     is_active = equipment_status != "Idle"
 
     # Map 8-state to boolean flags (matching Hubitat)
@@ -331,7 +332,7 @@ def _build_payload(
     is_fan_only = equipment_status == "Fan_only"
 
     # Thermostat mode from HA
-    thermostat_mode = attrs.get("hvac_mode")
+    thermostat_mode = hvac_mode
 
     # Temperature values
     current_temp = attrs.get("current_temperature")
@@ -515,13 +516,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             return
 
         attrs = (new_state.attributes or {})
+        hvac_mode = new_state.state  # Current thermostat mode (heat/cool/auto/off)
         hvac_action = attrs.get("hvac_action")
         classified_mode = _classify_mode(attrs)  # 'heating' | 'cooling' | 'fanonly' | 'idle'
         is_active = _attrs_is_active(attrs)
         was_active = bool(runtime_tracker.run_state.get("is_active"))
 
         # Get 8-state equipment status for Core payload
-        equipment_status = _classify_8_state(attrs, attrs.get("hvac_mode"))
+        equipment_status = _classify_8_state(attrs, hvac_mode)
         previous_status = runtime_tracker.run_state.get("last_equipment_status", "Idle")
 
         _LOGGER.debug(
@@ -561,6 +563,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 user_id=user_id,
                 hvac_id=hvac_id,
                 entity_id=new_state.entity_id,
+                hvac_mode=hvac_mode,
                 event_type="Mode_Change",
                 **common_kwargs,
             )
@@ -583,6 +586,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 user_id=user_id,
                 hvac_id=hvac_id,
                 entity_id=new_state.entity_id,
+                hvac_mode=hvac_mode,
                 runtime_seconds=secs,
                 cycle_start=start.isoformat() if start else None,
                 cycle_end=now.isoformat(),
@@ -614,6 +618,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 user_id=user_id,
                 hvac_id=hvac_id,
                 entity_id=new_state.entity_id,
+                hvac_mode=hvac_mode,
                 runtime_seconds=secs,
                 cycle_start=start.isoformat() if start else None,
                 cycle_end=now.isoformat(),
@@ -640,6 +645,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 user_id=user_id,
                 hvac_id=hvac_id,
                 entity_id=new_state.entity_id,
+                hvac_mode=hvac_mode,
                 event_type="Telemetry_Update",
                 **common_kwargs,
             )
@@ -651,6 +657,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 user_id=user_id,
                 hvac_id=hvac_id,
                 entity_id=new_state.entity_id,
+                hvac_mode=hvac_mode,
                 event_type="Telemetry_Update",
                 **common_kwargs,
             )
@@ -691,7 +698,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         if st and _is_climate_available(st):
             attrs = st.attributes or {}
             classified_mode = _classify_mode(attrs)
-            equipment_status = _classify_8_state(attrs, attrs.get("hvac_mode"))
+            equipment_status = _classify_8_state(attrs, st.state)
             if classified_mode in ("heating", "cooling", "fanonly"):
                 # Seed last_active_mode if we started mid-cycle
                 runtime_tracker.run_state["last_active_mode"] = classified_mode
