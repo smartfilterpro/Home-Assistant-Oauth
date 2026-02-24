@@ -55,6 +55,7 @@ class RuntimeTracker:
             "last_equipment_status": "Idle",  # 8-state system status
             "last_post_time": None,        # datetime of last post (for debounce)
             "last_post_status": None,      # equipment status of last post
+            "sequence_number": 0,          # monotonic event sequence counter
         }
     
     async def load_state(self):
@@ -83,6 +84,7 @@ class RuntimeTracker:
                 "is_active": bool(data.get("is_active", False)),
                 "last_active_mode": data.get("last_active_mode"),
                 "last_equipment_status": data.get("last_equipment_status", "Idle"),
+                "sequence_number": int(data.get("sequence_number", 0)),
             })
             
         except Exception as e:
@@ -96,6 +98,7 @@ class RuntimeTracker:
                 "is_active": self.run_state.get("is_active", False),
                 "last_active_mode": self.run_state.get("last_active_mode"),
                 "last_equipment_status": self.run_state.get("last_equipment_status", "Idle"),
+                "sequence_number": self.run_state.get("sequence_number", 0),
             }
 
             if self.run_state.get("active_since"):
@@ -131,6 +134,12 @@ class RuntimeTracker:
         """Record that a post was made (for debounce tracking)."""
         self.run_state["last_post_time"] = datetime.now(timezone.utc)
         self.run_state["last_post_status"] = equipment_status
+
+    def get_and_increment_sequence(self) -> int:
+        """Get and increment the event sequence number."""
+        seq = self.run_state.get("sequence_number", 0) + 1
+        self.run_state["sequence_number"] = seq
+        return seq
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -633,6 +642,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 previous_status, secs, equipment_status
             )
 
+            end_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
             await _post(end_payload)
             runtime_tracker.record_post(previous_status)
 
@@ -678,6 +688,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             if runtime_tracker.should_skip_duplicate_post(equipment_status, event_type):
                 return
 
+            payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
             await _post(payload)
             runtime_tracker.record_post(equipment_status)
 
@@ -730,22 +741,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                   if classified_mode == "idle"
                   else classified_mode if classified_mode in ("heating", "cooling", "fanonly") else None)
             previous_status = runtime_tracker.run_state.get("last_equipment_status", "Idle")
-            await _post(
-                _build_payload(
-                    s,
-                    user_id=user_id,
-                    hvac_id=hvac_id,
-                    entity_id=climate_eid,
-                    connected=_is_climate_available(s),
-                    device_name=s.name,
-                    thermostat_manufacturer=device_meta.get("manufacturer"),
-                    thermostat_model=device_meta.get("model"),
-                    last_mode=lm,
-                    is_reachable=_is_climate_available(s),
-                    event_type="Telemetry_Update",
-                    previous_status=previous_status,
-                )
+            send_now_payload = _build_payload(
+                s,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=climate_eid,
+                connected=_is_climate_available(s),
+                device_name=s.name,
+                thermostat_manufacturer=device_meta.get("manufacturer"),
+                thermostat_model=device_meta.get("model"),
+                last_mode=lm,
+                is_reachable=_is_climate_available(s),
+                event_type="Telemetry_Update",
+                previous_status=previous_status,
             )
+            send_now_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
+            await _post(send_now_payload)
 
     hass.services.async_register(DOMAIN, "send_now", _svc_send_now)
 
