@@ -56,6 +56,7 @@ class RuntimeTracker:
             "last_post_time": None,        # datetime of last post (for debounce)
             "last_post_status": None,      # equipment status of last post
             "sequence_number": 0,          # monotonic event sequence counter
+            "last_is_reachable": None,     # bool | None — tracks connectivity transitions
         }
     
     async def load_state(self):
@@ -85,6 +86,7 @@ class RuntimeTracker:
                 "last_active_mode": data.get("last_active_mode"),
                 "last_equipment_status": data.get("last_equipment_status", "Idle"),
                 "sequence_number": int(data.get("sequence_number", 0)),
+                "last_is_reachable": data.get("last_is_reachable"),
             })
             
         except Exception as e:
@@ -99,6 +101,7 @@ class RuntimeTracker:
                 "last_active_mode": self.run_state.get("last_active_mode"),
                 "last_equipment_status": self.run_state.get("last_equipment_status", "Idle"),
                 "sequence_number": self.run_state.get("sequence_number", 0),
+                "last_is_reachable": self.run_state.get("last_is_reachable"),
             }
 
             if self.run_state.get("active_since"):
@@ -556,7 +559,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 runtime_tracker.run_state["is_active"] = False
                 _LOGGER.info("SFP: Closed active cycle (device unreachable); duration=%ss", secs)
 
-            # Post explicit offline/unreachable event so the backend knows
+            # Post explicit offline/unreachable event so Core knows
             offline_payload = _build_payload(
                 new_state,
                 user_id=user_id,
@@ -568,14 +571,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 device_name=new_state.name if new_state else None,
                 thermostat_manufacturer=device_meta.get("manufacturer"),
                 thermostat_model=device_meta.get("model"),
-                event_type="Telemetry_Update",
+                event_type="CONNECTIVITY_CHANGE",
                 previous_status=previous_status,
             )
             offline_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
             await _post(offline_payload)
             runtime_tracker.record_post("Idle")
+            runtime_tracker.run_state["last_is_reachable"] = False
             await runtime_tracker.save_state()
             return
+
+        # Detect offline → online transition and send CONNECTIVITY_CHANGE
+        was_reachable = runtime_tracker.run_state.get("last_is_reachable")
+        if was_reachable is False:
+            _LOGGER.info("SFP: Device back online, sending CONNECTIVITY_CHANGE (is_reachable=true)")
+            online_payload = _build_payload(
+                new_state,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=new_state.entity_id,
+                hvac_mode=new_state.state,
+                connected=True,
+                is_reachable=True,
+                device_name=new_state.name,
+                thermostat_manufacturer=device_meta.get("manufacturer"),
+                thermostat_model=device_meta.get("model"),
+                event_type="CONNECTIVITY_CHANGE",
+                previous_status=runtime_tracker.run_state.get("last_equipment_status", "Idle"),
+            )
+            online_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
+            await _post(online_payload)
+            runtime_tracker.record_post("Idle")
+
+        runtime_tracker.run_state["last_is_reachable"] = True
 
         attrs = (new_state.attributes or {})
         hvac_mode = new_state.state  # Current thermostat mode (heat/cool/auto/off)
@@ -770,6 +798,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             runtime_tracker.run_state["last_equipment_status"] = equipment_status
             current_active = _attrs_is_active(attrs)
             runtime_tracker.run_state["is_active"] = current_active
+            # Seed reachability so the initial _handle_state doesn't
+            # fire a spurious CONNECTIVITY_CHANGE on first boot
+            if runtime_tracker.run_state.get("last_is_reachable") is None:
+                runtime_tracker.run_state["last_is_reachable"] = True
 
             # If we restored an active_since from storage, don't overwrite it
             if runtime_tracker.run_state["active_since"] is None and current_active:
