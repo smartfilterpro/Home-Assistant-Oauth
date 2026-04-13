@@ -357,8 +357,7 @@ def _build_payload(
             event_type = "Telemetry_Update"
 
     return {
-        # Device identification (matching Hubitat format)
-        "device_key": hvac_id,
+        # Device identification
         "device_id": hvac_id,
         "workspace_id": user_id,
         "user_id": user_id,
