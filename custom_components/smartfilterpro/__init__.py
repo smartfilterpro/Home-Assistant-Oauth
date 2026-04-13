@@ -520,7 +520,61 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     async def _handle_state(new_state) -> None:
         """Send payload on every climate state change; mark cycle start/stop."""
         if not _is_climate_available(new_state):
-            _LOGGER.debug("SFP: Skipping unavailable state: %s", new_state.state if new_state else "None")
+            _LOGGER.debug("SFP: Device unavailable, posting is_reachable=false: %s",
+                          new_state.state if new_state else "None")
+
+            # If there was an active cycle running, close it before reporting offline
+            was_active = bool(runtime_tracker.run_state.get("is_active"))
+            now = datetime.now(timezone.utc)
+            previous_status = runtime_tracker.run_state.get("last_equipment_status", "Idle")
+
+            if was_active:
+                start = runtime_tracker.run_state.get("active_since")
+                secs = _calculate_runtime_seconds(start, now)
+                end_payload = _build_payload(
+                    new_state,
+                    user_id=user_id,
+                    hvac_id=hvac_id,
+                    entity_id=new_state.entity_id if new_state else climate_eid,
+                    hvac_mode=new_state.state if new_state else None,
+                    runtime_seconds=secs,
+                    cycle_start=start.isoformat() if start else None,
+                    cycle_end=now.isoformat(),
+                    connected=False,
+                    is_reachable=False,
+                    device_name=new_state.name if new_state else None,
+                    thermostat_manufacturer=device_meta.get("manufacturer"),
+                    thermostat_model=device_meta.get("model"),
+                    event_type="Mode_Change",
+                    previous_status=previous_status,
+                    runtime_type="END",
+                )
+                end_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
+                await _post(end_payload)
+                runtime_tracker.record_post(previous_status)
+                runtime_tracker.run_state["active_since"] = None
+                runtime_tracker.run_state["is_active"] = False
+                _LOGGER.info("SFP: Closed active cycle (device unreachable); duration=%ss", secs)
+
+            # Post explicit offline/unreachable event so the backend knows
+            offline_payload = _build_payload(
+                new_state,
+                user_id=user_id,
+                hvac_id=hvac_id,
+                entity_id=new_state.entity_id if new_state else climate_eid,
+                hvac_mode=new_state.state if new_state else None,
+                connected=False,
+                is_reachable=False,
+                device_name=new_state.name if new_state else None,
+                thermostat_manufacturer=device_meta.get("manufacturer"),
+                thermostat_model=device_meta.get("model"),
+                event_type="Telemetry_Update",
+                previous_status=previous_status,
+            )
+            offline_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
+            await _post(offline_payload)
+            runtime_tracker.record_post("Idle")
+            await runtime_tracker.save_state()
             return
 
         attrs = (new_state.attributes or {})
