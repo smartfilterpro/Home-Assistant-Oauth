@@ -150,7 +150,6 @@ Find each place where events are created and add sequence numbers.
 ```python
 # Around line 400-500, when building Mode_Change event
 event_payload = {
-    "device_key": device_key,
     "device_id": hvac_id,
     "workspace_id": user_id,
     "timestamp": _now_iso(),
@@ -165,7 +164,6 @@ event_payload = {
 ```python
 # Around line 500-600, when building State_Update event
 event_payload = {
-    "device_key": device_key,
     "device_id": hvac_id,
     "workspace_id": user_id,
     "timestamp": _now_iso(),
@@ -180,7 +178,6 @@ event_payload = {
 ```python
 # Around line 300-400, when building Connectivity_Change event
 event_payload = {
-    "device_key": device_key,
     "device_id": hvac_id,
     "workspace_id": user_id,
     "timestamp": _now_iso(),
@@ -244,7 +241,7 @@ async def _handle_gap_response(hass: HomeAssistant, entry: ConfigEntry, response
     event_buffer: EventBuffer = hass.data[DOMAIN][entry.entry_id]["event_buffer"]
     
     for gap in gaps:
-        device_key = gap.get("device_key")
+        device_id = gap.get("device_id")
         source_vendor = gap.get("source_vendor")
         missing_sequences = gap.get("missing_sequences", [])
         
@@ -254,7 +251,7 @@ async def _handle_gap_response(hass: HomeAssistant, entry: ConfigEntry, response
         _LOGGER.warning(
             "⚠️ SFP: Core reported %d missing sequence(s) for %s: %s",
             len(missing_sequences),
-            device_key,
+            device_id,
             missing_sequences
         )
         
@@ -272,9 +269,9 @@ async def _handle_gap_response(hass: HomeAssistant, entry: ConfigEntry, response
             success = await _post_events_to_core(hass, entry, missing_events)
             
             if success:
-                _LOGGER.info("✅ SFP: Successfully recovered gap for %s", device_key)
+                _LOGGER.info("✅ SFP: Successfully recovered gap for %s", device_id)
             else:
-                _LOGGER.error("❌ SFP: Failed to resend missing events for %s", device_key)
+                _LOGGER.error("❌ SFP: Failed to resend missing events for %s", device_id)
         else:
             _LOGGER.error(
                 "❌ SFP: Cannot recover gap - events not in buffer. "
@@ -356,12 +353,12 @@ Event Stream: 1 → 2 → 3 → [network hiccup] → 5 → 6
 
 4. **Verify in Core database**:
    ```sql
-   SELECT device_key, source_vendor, COUNT(*) as gaps
+   SELECT device_id, source_vendor, COUNT(*) as gaps
    FROM ingestion_gaps
    WHERE source_vendor = 'home_assistant'
      AND status = 'resolved'
      AND detected_at > NOW() - INTERVAL '24 hours'
-   GROUP BY device_key, source_vendor;
+   GROUP BY device_id, source_vendor;
    ```
 
 ---
