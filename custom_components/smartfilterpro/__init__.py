@@ -422,10 +422,23 @@ def _build_payload(
     # (ecobee, Honeywell, Sensibo, etc.) don't expose humidity on the climate
     # entity, so fall back to a humidity sensor discovered on the same device.
     humidity = attrs.get("current_humidity")
+    humidity_source = "climate.current_humidity"
     if humidity is None:
         humidity = attrs.get("humidity")
-    if humidity is None:
+        if humidity is not None:
+            humidity_source = "climate.humidity"
+    if humidity is None and humidity_fallback is not None:
         humidity = humidity_fallback
+        humidity_source = "sibling_sensor"
+    if humidity is None:
+        humidity_source = "missing"
+        _LOGGER.warning(
+            "SFP: humidity unavailable for %s — climate attrs have no current_humidity/humidity "
+            "and no sibling humidity sensor was found. Available attr keys: %s",
+            entity_id, sorted(list(attrs.keys())),
+        )
+    else:
+        _LOGGER.info("SFP: humidity=%s source=%s entity=%s", humidity, humidity_source, entity_id)
     heat_setpoint = attrs.get("target_temp_low") or attrs.get("temperature")
     cool_setpoint = attrs.get("target_temp_high") or attrs.get("temperature")
 
@@ -466,8 +479,12 @@ def _build_payload(
         # Temperature data
         "last_temperature": current_temp,
         "temperature_f": current_temp,
+        # Humidity data — emit under every key Core / downstream consumers
+        # might read so the percent reading isn't dropped on the floor.
         "humidity": humidity,
         "last_humidity": humidity,
+        "humidity_pct": humidity,
+        "current_humidity": humidity,
         "last_heat_setpoint": heat_setpoint,
         "heat_setpoint_f": heat_setpoint,
         "last_cool_setpoint": cool_setpoint,
