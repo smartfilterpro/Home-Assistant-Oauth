@@ -293,6 +293,75 @@ def _calculate_runtime_seconds(start_time: datetime, end_time: datetime) -> int:
     return delta_seconds
 
 
+def _discover_humidity_entity_id(hass: HomeAssistant, climate_eid: Optional[str]) -> Optional[str]:
+    """Find a humidity sensor entity registered against the same device as the climate entity.
+
+    Many climate integrations (ecobee, Honeywell, Sensibo, etc.) expose the
+    thermostat's humidity as a separate `sensor` entity with
+    device_class=humidity rather than on the climate entity's attributes.
+    Prefer a sensor whose name looks like the "current" / indoor humidity,
+    falling back to the first humidity sensor on the device.
+    """
+    if not climate_eid:
+        return None
+    try:
+        ent_reg = er.async_get(hass)
+        ent = ent_reg.async_get(climate_eid)
+        if not ent or not ent.device_id:
+            return None
+
+        candidates: list[str] = []
+        for reg_ent in er.async_entries_for_device(
+            ent_reg, ent.device_id, include_disabled_entities=False
+        ):
+            if reg_ent.domain != "sensor":
+                continue
+            # Device class can live on the entity registry entry or on the
+            # state's attributes; check both.
+            dc = (reg_ent.device_class or reg_ent.original_device_class or "").lower()
+            if dc != "humidity":
+                st = hass.states.get(reg_ent.entity_id)
+                st_dc = (st.attributes.get("device_class") if st else "") or ""
+                if st_dc.lower() != "humidity":
+                    continue
+            candidates.append(reg_ent.entity_id)
+
+        if not candidates:
+            return None
+
+        # Prefer entities that look like current/indoor humidity over
+        # outdoor/forecast sensors.
+        def _score(eid: str) -> int:
+            low = eid.lower()
+            score = 0
+            if "outdoor" in low or "outside" in low or "forecast" in low:
+                score -= 10
+            if "current" in low or "indoor" in low or "inside" in low:
+                score += 5
+            if low.endswith("_humidity") or low.endswith(".humidity"):
+                score += 2
+            return score
+
+        candidates.sort(key=_score, reverse=True)
+        return candidates[0]
+    except Exception as e:
+        _LOGGER.debug("SFP humidity sensor discovery failed: %s", e)
+        return None
+
+
+def _read_humidity_from_entity(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[float]:
+    """Read current humidity value from a sensor entity; return None if unavailable."""
+    if not entity_id:
+        return None
+    st = hass.states.get(entity_id)
+    if not st or st.state in (None, "", STATE_UNKNOWN, STATE_UNAVAILABLE, "unavailable", "unknown"):
+        return None
+    try:
+        return float(st.state)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _ensure_valid_token(hass: HomeAssistant, entry: ConfigEntry) -> Optional[str]:
     """Centralized check via SfpAuth; returns latest access token."""
     auth = SfpAuth(hass, entry)
@@ -326,6 +395,7 @@ def _build_payload(
     event_type: Optional[str] = None,
     previous_status: Optional[str] = None,
     runtime_type: Optional[str] = None,
+    humidity_fallback: Optional[float] = None,
 ) -> dict:
     """
     Payload shape expected by Railway Core (matches Hubitat 8-state format).
@@ -348,7 +418,14 @@ def _build_payload(
 
     # Temperature values
     current_temp = attrs.get("current_temperature")
-    humidity = attrs.get("current_humidity") or attrs.get("humidity")
+    # Prefer the climate entity's own humidity attribute; many thermostats
+    # (ecobee, Honeywell, Sensibo, etc.) don't expose humidity on the climate
+    # entity, so fall back to a humidity sensor discovered on the same device.
+    humidity = attrs.get("current_humidity")
+    if humidity is None:
+        humidity = attrs.get("humidity")
+    if humidity is None:
+        humidity = humidity_fallback
     heat_setpoint = attrs.get("target_temp_low") or attrs.get("temperature")
     cool_setpoint = attrs.get("target_temp_high") or attrs.get("temperature")
 
@@ -459,6 +536,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         except Exception as e:
             _LOGGER.debug("SFP device meta lookup failed: %s", e)
 
+    # Discover a humidity sensor on the same device as the climate entity.
+    # Many thermostats don't expose humidity on the climate entity itself, so
+    # we fall back to a sibling sensor with device_class=humidity.
+    humidity_entity_id = _discover_humidity_entity_id(hass, climate_eid)
+    if humidity_entity_id:
+        _LOGGER.info(
+            "SFP: discovered humidity sensor %s for climate %s",
+            humidity_entity_id, climate_eid,
+        )
+    elif climate_eid:
+        _LOGGER.debug(
+            "SFP: no humidity sensor found on the same device as %s; "
+            "will rely on climate entity attributes only", climate_eid,
+        )
+
     # Initialize runtime tracker with persistence
     runtime_tracker = RuntimeTracker(hass, entry.entry_id)
     await runtime_tracker.load_state()
@@ -551,6 +643,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     event_type="Mode_Change",
                     previous_status=previous_status,
                     runtime_type="END",
+                    humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
                 )
                 end_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
                 await _post(end_payload)
@@ -573,6 +666,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 thermostat_model=device_meta.get("model"),
                 event_type="CONNECTIVITY_CHANGE",
                 previous_status=previous_status,
+                humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
             )
             offline_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
             await _post(offline_payload)
@@ -598,6 +692,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 thermostat_model=device_meta.get("model"),
                 event_type="CONNECTIVITY_CHANGE",
                 previous_status=runtime_tracker.run_state.get("last_equipment_status", "Idle"),
+                humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
             )
             online_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
             await _post(online_payload)
@@ -635,6 +730,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         payload = None
         now = datetime.now(timezone.utc)
 
+        # Pre-resolve humidity fallback once per state change so every payload
+        # this handler emits sees the same value.
+        humidity_fallback = _read_humidity_from_entity(hass, humidity_entity_id)
+
         common_kwargs = dict(
             thermostat_manufacturer=device_meta.get("manufacturer"),
             thermostat_model=device_meta.get("model"),
@@ -643,6 +742,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             last_mode=runtime_tracker.run_state.get("last_active_mode") if classified_mode == "idle" else classified_mode,
             is_reachable=_is_climate_available(new_state),
             previous_status=previous_status,
+            humidity_fallback=humidity_fallback,
         )
 
         if not was_active and is_active:
@@ -689,6 +789,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 event_type="Mode_Change",
                 previous_status=previous_status,
                 runtime_type="END",
+                humidity_fallback=humidity_fallback,
             )
             runtime_tracker.run_state["active_since"] = None
             _LOGGER.info(
@@ -839,6 +940,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 is_reachable=_is_climate_available(s),
                 event_type="Telemetry_Update",
                 previous_status=previous_status,
+                humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
             )
             send_now_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
             await _post(send_now_payload)
