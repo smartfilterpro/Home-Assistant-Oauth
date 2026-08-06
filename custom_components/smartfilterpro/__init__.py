@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -88,9 +89,22 @@ class RuntimeTracker:
                 "sequence_number": int(data.get("sequence_number", 0)),
                 "last_is_reachable": data.get("last_is_reachable"),
             })
-            
+
         except Exception as e:
             _LOGGER.warning("SFP: Failed to load runtime state: %s", e)
+
+        # Seed fresh/reset counters from epoch milliseconds (Hubitat's proven
+        # approach). Core's unique index on (device_id, source_vendor,
+        # sequence_number) silently DROPS any event at or below the stored
+        # high-water mark for this device — so if this Store file is ever
+        # lost/reset, restarting at 1 would make Core discard every event
+        # until the counter climbed past the old maximum. An epoch-ms seed
+        # always leaps the high-water mark immediately. Existing non-zero
+        # counters are left untouched and keep incrementing normally.
+        if not self.run_state.get("sequence_number"):
+            seed = int(time.time() * 1000)
+            self.run_state["sequence_number"] = seed
+            _LOGGER.info("SFP: Seeding sequence counter from epoch-ms: %d", seed)
     
     async def save_state(self):
         """Persist current runtime state."""
