@@ -22,8 +22,10 @@ from .const import (
     CONF_RESET_PATH, CONF_STATUS_URL, CONF_REFRESH_PATH,
     # tokens
     CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_EXPIRES_AT,
+    # environment toggle
+    CONF_USE_TEST_ENV, API_BASE_LIVE, API_BASE_TEST,
     # defaults
-    DEFAULT_API_BASE, DEFAULT_LOGIN_PATH, DEFAULT_POST_PATH,
+    DEFAULT_LOGIN_PATH, DEFAULT_POST_PATH,
     DEFAULT_RESET_PATH, DEFAULT_STATUS_URL, DEFAULT_REFRESH_PATH,
 )
 
@@ -80,10 +82,11 @@ def _climate_entity_ids(hass: HomeAssistant) -> list[str]:
         return []
 
 
-# User-facing login schema (simple - just email/password)
+# User-facing login schema (email/password + optional test-environment toggle)
 STEP_LOGIN_SCHEMA = vol.Schema({
     vol.Required(CONF_EMAIL): str,
     vol.Required(CONF_PASSWORD): str,
+    vol.Optional(CONF_USE_TEST_ENV, default=False): bool,
 })
 
 
@@ -106,9 +109,10 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         email = user_input[CONF_EMAIL].strip()
         password = user_input[CONF_PASSWORD]
+        use_test_env = bool(user_input.get(CONF_USE_TEST_ENV, False))
 
         # Use defaults for all endpoints (not shown in UI)
-        api_base = DEFAULT_API_BASE.rstrip("/")
+        api_base = (API_BASE_TEST if use_test_env else API_BASE_LIVE).rstrip("/")
         login_path = DEFAULT_LOGIN_PATH.strip("/")
         post_path = DEFAULT_POST_PATH.strip("/")
         reset_path = DEFAULT_RESET_PATH.strip("/")
@@ -247,7 +251,6 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return await self.async_step_climate()
 
     # ------------- Step 3: Optional HA climate entity (with Skip) -------------
-    @callback
     async def async_step_climate(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
         try:
             ha_climates = sorted(list(self.hass.states.async_entity_ids("climate")))

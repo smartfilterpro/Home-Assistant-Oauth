@@ -35,8 +35,15 @@ CONF_CLIMATE_ENTITY_ID = "climate_entity_id"
 CONF_CORE_TOKEN = "core_token"
 CONF_CORE_TOKEN_EXP = "core_token_exp"  # epoch seconds (UTC)
 
-# ==== Defaults (update base or version when you flip from test→live) ====
-DEFAULT_API_BASE = "https://smartfilterpro.com/version-test"
+# Optional "use test environment" toggle (parity with the Hubitat app)
+CONF_USE_TEST_ENV = "use_test_env"
+
+# ==== API environments ====
+API_BASE_LIVE = "https://smartfilterpro.com"
+API_BASE_TEST = "https://smartfilterpro.com/version-test"
+
+# ==== Defaults ====
+DEFAULT_API_BASE = API_BASE_LIVE
 DEFAULT_LOGIN_PATH = "/api/1.1/wf/ha_password_login"
 DEFAULT_POST_PATH = "/api/1.1/wf/ha_telemetry"
 DEFAULT_RESET_PATH = "/api/1.1/wf/ha_reset_filter"

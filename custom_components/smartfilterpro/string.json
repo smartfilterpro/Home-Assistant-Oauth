@@ -4,7 +4,7 @@
       "user": {
         "title": "SmartFilterPro — Sign In",
         "description": "Enter your SmartFilterPro email and password to link your account.",
-        "data": { "email": "Email address", "password": "Password" }
+        "data": { "email": "Email address", "password": "Password", "use_test_env": "Use test environment" }
       },
       "select_hvac": {
         "title": "Select Thermostat",
