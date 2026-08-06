@@ -32,7 +32,6 @@ class SmartFilterProCoordinator(DataUpdateCoordinator):
             _LOGGER.exception("SmartFilterPro poll failed: %s", e)
             raise
 
-    @callback
     async def async_handle_webhook(self, hass, webhook_id, request):
         try:
             payload = await request.json()

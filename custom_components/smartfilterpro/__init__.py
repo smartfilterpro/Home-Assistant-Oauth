@@ -874,7 +874,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             await _post(payload)
             runtime_tracker.record_post(equipment_status)
 
-    @callback
     async def _on_change(event):
         new = event.data.get("new_state")
         if new and (not climate_eid or new.entity_id == climate_eid):
