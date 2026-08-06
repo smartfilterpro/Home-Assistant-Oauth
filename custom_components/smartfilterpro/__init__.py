@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
 from homeassistant.helpers import entity_registry as er, device_registry as dr
@@ -40,6 +43,17 @@ ENTRY_VERSION = 2
 
 # Maximum reasonable runtime in seconds (24 hours)
 MAX_RUNTIME_SECONDS = 86400
+
+# ---- Outbox (failed-POST retry queue) tuning ----
+# Cap on pending entries; oldest is dropped (with a warning) on overflow.
+OUTBOX_MAX_ENTRIES = 100
+# Backoff schedule between retry attempts, in seconds. Attempts beyond the
+# schedule reuse the last step.
+OUTBOX_BACKOFF_STEPS = [60, 120, 300, 600, 1800]
+# Give up on an entry after this many failed retries (error log, then drop).
+OUTBOX_MAX_ATTEMPTS = 10
+# How often the drain task wakes up to look for due entries.
+OUTBOX_DRAIN_INTERVAL_SECONDS = 60
 
 
 class RuntimeTracker:
@@ -157,6 +171,75 @@ class RuntimeTracker:
         seq = self.run_state.get("sequence_number", 0) + 1
         self.run_state["sequence_number"] = seq
         return seq
+
+
+class Outbox:
+    """Store-persisted queue of payloads whose POST to Core failed.
+
+    A failed POST used to be logged and dropped, permanently burning the
+    event's already-consumed sequence number — Core's gap detector flagged
+    a gap that HA could never answer. Failed payloads now wait here (across
+    restarts, via the same HA Store mechanism as RuntimeTracker) and are
+    replayed UNCHANGED, so the original sequence_number and dedup keys
+    survive. Replay order doesn't matter to Core: its partial unique index
+    on (device_id, source_vendor, sequence_number) dedups retries, and its
+    sequence tracker advances via GREATEST so out-of-order replays never
+    regress the high-water mark.
+
+    Note on gap recovery: Core's ingest response contains NO gap info
+    (gap detection runs async after the response is sent), and
+    home_assistant is a DIRECT_VENDOR in Core's backfill worker (no bridge
+    URL to call back) — detected gaps are terminally marked failed. Gap
+    prevention therefore relies entirely on this outbox not dropping
+    events.
+
+    Each entry: {"payload": dict, "attempts": int, "next_attempt_at": float
+    (epoch seconds)}.
+    """
+
+    def __init__(self, hass: HomeAssistant, entry_id: str):
+        self.hass = hass
+        self._store = Store(hass, 1, f"smartfilterpro_{entry_id}_outbox")
+        self.entries: list[dict] = []
+
+    async def load(self):
+        """Load pending entries from storage."""
+        try:
+            data = await self._store.async_load() or {}
+            entries = data.get("entries", [])
+            if isinstance(entries, list):
+                self.entries = [e for e in entries if isinstance(e, dict) and e.get("payload")]
+            if self.entries:
+                _LOGGER.info("SFP: Outbox loaded %d pending event(s)", len(self.entries))
+        except Exception as e:
+            _LOGGER.warning("SFP: Failed to load outbox: %s", e)
+
+    async def save(self):
+        """Persist pending entries to storage."""
+        try:
+            await self._store.async_save({"entries": self.entries})
+        except Exception as e:
+            _LOGGER.warning("SFP: Failed to save outbox: %s", e)
+
+    def add(self, payload: dict):
+        """Queue a failed payload for retry (drop-oldest on overflow)."""
+        if len(self.entries) >= OUTBOX_MAX_ENTRIES:
+            dropped = self.entries.pop(0)
+            _LOGGER.warning(
+                "SFP: Outbox full (%d entries); dropping oldest pending event "
+                "(sequence_number=%s)",
+                OUTBOX_MAX_ENTRIES,
+                (dropped.get("payload") or {}).get("sequence_number"),
+            )
+        self.entries.append({
+            "payload": payload,
+            "attempts": 0,
+            "next_attempt_at": time.time() + OUTBOX_BACKOFF_STEPS[0],
+        })
+        _LOGGER.info(
+            "SFP: Queued failed event in outbox (sequence_number=%s, %d pending)",
+            payload.get("sequence_number"), len(self.entries),
+        )
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -569,6 +652,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     runtime_tracker = RuntimeTracker(hass, entry.entry_id)
     await runtime_tracker.load_state()
 
+    # Persistent retry queue for failed Core posts (see Outbox docstring:
+    # Core cannot ask HA to backfill, so gap-free delivery depends on this).
+    outbox = Outbox(hass, entry.entry_id)
+    await outbox.load()
+
     async def _post_to_core(payload: dict, is_retry: bool = False) -> bool:
         """Post telemetry directly to Railway Core using Core JWT token."""
         # Get Core JWT token (refreshes automatically if expired)
@@ -623,8 +711,65 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             return False
 
     async def _post(payload: dict) -> None:
-        """Post telemetry to Railway Core."""
-        await _post_to_core(payload)
+        """Post telemetry to Railway Core; queue in the outbox on failure.
+
+        _post_to_core has already done its own 401-refresh retry by the time
+        it returns False, so anything that lands here failed for real. The
+        payload's sequence number was consumed before the POST, so dropping
+        it would leave a gap Core can never backfill — queue it instead.
+        """
+        if not await _post_to_core(payload):
+            outbox.add(payload)
+            await outbox.save()
+
+    async def _drain_outbox(_now=None) -> None:
+        """Retry queued payloads whose backoff has elapsed.
+
+        Replays the ORIGINAL payload unchanged — sequence_number and dedup
+        keys must survive so Core's unique index dedups and its high-water
+        mark advances correctly.
+        """
+        if not outbox.entries:
+            return
+        now_ts = time.time()
+        due = [e for e in outbox.entries if e.get("next_attempt_at", 0) <= now_ts]
+        if not due:
+            return
+        changed = False
+        for item in due:
+            payload = item["payload"]
+            if await _post_to_core(payload):
+                outbox.entries.remove(item)
+                changed = True
+                _LOGGER.info(
+                    "SFP: Outbox replay succeeded (sequence_number=%s, %d remaining)",
+                    payload.get("sequence_number"), len(outbox.entries),
+                )
+                continue
+            item["attempts"] = item.get("attempts", 0) + 1
+            changed = True
+            if item["attempts"] >= OUTBOX_MAX_ATTEMPTS:
+                outbox.entries.remove(item)
+                _LOGGER.error(
+                    "SFP: Dropping outbox event after %d failed attempts "
+                    "(sequence_number=%s) — Core will see a permanent gap",
+                    item["attempts"], payload.get("sequence_number"),
+                )
+            else:
+                step = OUTBOX_BACKOFF_STEPS[
+                    min(item["attempts"], len(OUTBOX_BACKOFF_STEPS) - 1)
+                ]
+                item["next_attempt_at"] = now_ts + step
+                _LOGGER.debug(
+                    "SFP: Outbox retry %d failed (sequence_number=%s); next in %ds",
+                    item["attempts"], payload.get("sequence_number"), step,
+                )
+        if changed:
+            await outbox.save()
+
+    unsub_outbox = async_track_time_interval(
+        hass, _drain_outbox, timedelta(seconds=OUTBOX_DRAIN_INTERVAL_SECONDS)
+    )
 
     async def _handle_state(new_state) -> None:
         """Send payload on every climate state change; mark cycle start/stop."""
@@ -963,7 +1108,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        STORAGE_KEY: {"unsub_telemetry": unsub_telemetry, "runtime_tracker": runtime_tracker}
+        STORAGE_KEY: {
+            "unsub_telemetry": unsub_telemetry,
+            "runtime_tracker": runtime_tracker,
+            "outbox": outbox,
+            "unsub_outbox": unsub_outbox,
+        }
     }
     entry.async_on_unload(entry.add_update_listener(_reload))
     return True
@@ -982,12 +1132,27 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
                 unsub()
             except Exception:
                 pass
-        
+
+        unsub_outbox = data[STORAGE_KEY].get("unsub_outbox")
+        if unsub_outbox:
+            try:
+                unsub_outbox()
+            except Exception:
+                pass
+
         # Save final state before unloading
         runtime_tracker = data[STORAGE_KEY].get("runtime_tracker")
         if runtime_tracker:
             try:
                 await runtime_tracker.save_state()
+            except Exception:
+                pass
+
+        # Persist any still-pending outbox entries so they survive the unload
+        outbox = data[STORAGE_KEY].get("outbox")
+        if outbox:
+            try:
+                await outbox.save()
             except Exception:
                 pass
     
