@@ -1,0 +1,67 @@
+# Release gate. Runs when a GitHub Release is published (that is the moment
+# HACS starts offering the version to users).
+#
+#   1. The tag must be vX.Y.Z (or vX.Y.Z-beta.N for a pre-release) and
+#      custom_components/smartfilterpro/manifest.json must say exactly X.Y.Z
+#      (or X.Y.Z-beta.N). Home Assistant shows the manifest version, HACS
+#      shows the tag; v0.0.5 shipped with a 0.0.4 manifest and nothing caught
+#      it. If they disagree, the job fails loudly on the release page.
+#   2. A pre-release tag must be published as a pre-release, and a stable tag
+#      must not — HACS hides pre-releases from users who haven't opted in.
+#   3. Attach smartfilterpro.zip (the custom_components folder) to the
+#      release for manual installs.
+#
+# How to release:
+#   - bump "version" in manifest.json on the branch, merge to main
+#   - GitHub → Releases → Draft a new release → tag v<that version> on main
+#   - tick "pre-release" for a -beta.N tag, leave it unticked otherwise
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-attach:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: tag matches manifest version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -eu
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::tag '$TAG' must look like v1.2.3 or v1.2.3-beta.1"; exit 1 ;;
+          esac
+          expected="${TAG#v}"
+          actual=$(python -c "import json;print(json.load(open('custom_components/smartfilterpro/manifest.json'))['version'])")
+          echo "tag=$TAG manifest=$actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::manifest.json version is '$actual' but the release tag is '$TAG'. Bump the manifest and re-tag."
+            exit 1
+          fi
+          case "$expected" in
+            *-*) if [ "$PRERELEASE" != "true" ]; then
+                   echo "::error::'$TAG' is a pre-release version but the release is not marked pre-release"; exit 1; fi ;;
+            *)   if [ "$PRERELEASE" = "true" ]; then
+                   echo "::error::'$TAG' is a stable version but the release is marked pre-release"; exit 1; fi ;;
+          esac
+
+      - name: build zip
+        run: |
+          cd custom_components/smartfilterpro
+          zip -r ../../smartfilterpro.zip . -x '__pycache__/*' '*.pyc'
+
+      - name: attach zip to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" smartfilterpro.zip --clobber
