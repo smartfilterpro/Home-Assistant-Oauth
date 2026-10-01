@@ -14,6 +14,7 @@ from homeassistant.helpers.event import (
 )
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er, device_registry as dr
 from homeassistant.helpers.storage import Store
 
@@ -40,6 +41,12 @@ ACTIVE_ACTIONS = {"heating", "cooling", "fan"}
 FAN_ACTIVE_MODES = {"on", "on_high", "circulate"}
 
 ENTRY_VERSION = 2
+
+# This integration is configured only through config entries (the UI flow);
+# there is nothing to put under `smartfilterpro:` in configuration.yaml.
+# hassfest requires this to be stated for integrations that define
+# async_setup.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 # Maximum reasonable runtime in seconds (24 hours)
 MAX_RUNTIME_SECONDS = 86400
