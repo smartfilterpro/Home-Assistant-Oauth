@@ -1,0 +1,52 @@
+# Runs on every push and pull request. Two independent checks:
+#
+#   hassfest  — Home Assistant's own manifest/translations/config-flow linter,
+#               the same one Core runs on built-in integrations.
+#   hacs      — HACS's validation: repository layout, hacs.json, manifest
+#               fields HACS needs to list and install the integration.
+#
+# Neither needs secrets. A failure here means a user installing from HACS
+# would hit the same problem.
+name: Validate
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  hassfest:
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  # The manifest version is what Home Assistant shows; the git tag is what
+  # HACS shows. They must agree, and a tag is only cut by the release
+  # workflow — so on branches we just make sure the manifest is a sane
+  # semantic version and the test script passes.
+  unit:
+    name: environment tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/test_environments.py
+      - name: manifest version is semantic
+        run: |
+          v=$(python -c "import json;print(json.load(open('custom_components/smartfilterpro/manifest.json'))['version'])")
+          echo "manifest version: $v"
+          echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'

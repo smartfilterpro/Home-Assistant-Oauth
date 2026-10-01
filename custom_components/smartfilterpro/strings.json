@@ -4,24 +4,35 @@
       "user": {
         "title": "SmartFilterPro — Sign In",
         "description": "Enter your SmartFilterPro email and password to link your account.",
-        "data": { "email": "Email address", "password": "Password", "use_test_env": "Use test environment" }
+        "data": {
+          "email": "Email address",
+          "password": "Password",
+          "environment": "Environment"
+        },
+        "data_description": {
+          "environment": "Leave on Production unless SmartFilterPro support asked you to test a development build."
+        }
       },
-      "select_hvac": {
+      "hvac": {
         "title": "Select Thermostat",
         "description": "Multiple SmartFilterPro devices were found. Choose which HVAC to link.",
         "data": { "hvac_id": "Thermostat" }
       },
-      "select_entity": {
+      "climate": {
         "title": "Choose Thermostat Entity",
         "description": "Pick the Home Assistant climate entity to forward to SmartFilterPro.",
-        "data": { "entity_id": "Thermostat (climate.*)" }
+        "data": { "climate_entity_id": "Thermostat (climate.*)" }
       }
     },
     "error": {
       "required": "Required",
       "cannot_connect": "Could not connect. Check server/workflow.",
       "not_found": "We could not find a thermostat for this account.",
-      "no_climate": "No climate entities found in Home Assistant."
+      "no_climate": "No climate entities found in Home Assistant.",
+      "unknown": "Unexpected response from SmartFilterPro."
+    },
+    "abort": {
+      "no_thermostats_found": "No thermostats are linked to this SmartFilterPro account."
     }
   }
 }

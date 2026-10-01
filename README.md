@@ -46,6 +46,22 @@ After installation and restart, add the integration:
 
 ---
 
+## Choosing a version
+
+HACS only offers **published GitHub Releases** of this repository, never raw branches.
+
+- **Stable releases** (`v0.1.0`, `v0.2.0`, …) are what every HACS user sees and gets on update.
+- **Beta releases** (`v0.2.0-beta.1`, …) are marked *pre-release*. HACS hides them unless you open the SmartFilterPro entry in HACS, choose **Redownload**, and turn on **Show beta versions**. Use these only when SmartFilterPro support asks you to test a fix.
+- To go back to an earlier version, use **Redownload** and pick it from the list.
+
+The version shown in Home Assistant (Settings → Devices & Services → SmartFilterPro) always matches the release tag.
+
+## Environment (for testers)
+
+The sign-in form has an **Environment** dropdown. Leave it on **Production** unless SmartFilterPro support asked you to test against the development environment. The choice sets both the SmartFilterPro app the integration logs into and the server it reports runtime to, so the two always match.
+
+---
+
 ## Requirements
 
 - Home Assistant `2024.6.0` or newer  
@@ -63,3 +79,13 @@ After installation and restart, add the integration:
 ## Disclaimer
 
 This is a custom integration and is **not yet part of Home Assistant Core**.
+
+---
+
+## For maintainers: branches and releases
+
+- `dev` is where changes land first. `main` only receives merges from `dev` once they have been tested.
+- Merging to `main` publishes nothing. Users get a version only when a **GitHub Release** is published, so a release is a deliberate step.
+- To release: bump `"version"` in `custom_components/smartfilterpro/manifest.json` on `dev`, merge to `main`, then on GitHub choose **Releases → Draft a new release**, create tag `v<that version>` on `main`, and publish. Tick **pre-release** only for a `-beta.N` version.
+- The *Release* workflow then checks that the tag and the manifest version agree, that pre-release is ticked for betas and not otherwise, and attaches `smartfilterpro.zip` for manual installs. If the check fails, fix the manifest and re-tag; HACS users never see a mismatched version.
+- The *Validate* workflow runs Home Assistant's `hassfest` and the HACS validator on every push and pull request.
