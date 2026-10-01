@@ -21,11 +21,11 @@ from .const import (
     DOMAIN,
     PLATFORMS,
     STORAGE_KEY,
-    CORE_INGEST_URL,
+    core_ingest_url_for,
     # ids
     CONF_USER_ID, CONF_HVAC_ID, CONF_CLIMATE_ENTITY_ID,
     # posting
-    CONF_API_BASE, CONF_POST_PATH,
+    CONF_API_BASE, CONF_POST_PATH, CONF_ENVIRONMENT, CONF_CORE_INGEST_URL,
     # tokens
     CONF_ACCESS_TOKEN,
 )
@@ -495,8 +495,8 @@ def _build_payload(
     humidity_fallback: Optional[float] = None,
 ) -> dict:
     """
-    Payload shape expected by Railway Core (matches Hubitat 8-state format).
-    Posts directly to core-ingest-ingest.up.railway.app
+    Payload shape expected by Core Ingest (matches Hubitat 8-state format).
+    Posted to the Core URL of the entry's environment (see const.ENVIRONMENTS).
     """
     attrs = state.attributes if state else {}
     ts = _now_iso()
@@ -610,8 +610,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         return True
 
-    # Post telemetry directly to Railway Core (like Hubitat does)
-    core_ingest_url = CORE_INGEST_URL
+    # Post telemetry directly to Core (like Hubitat does), to the Core that
+    # matches the Bubble environment this entry logged into. Entries from
+    # before the environment selector only carry api_base; derive from that.
+    core_ingest_url = entry.data.get(CONF_CORE_INGEST_URL) or core_ingest_url_for(
+        entry.data.get(CONF_ENVIRONMENT), api_base
+    )
+    _LOGGER.info(
+        "SFP environment=%s core=%s",
+        entry.data.get(CONF_ENVIRONMENT) or "(derived from api_base)", core_ingest_url,
+    )
     session = async_get_clientsession(hass)
 
     # Pull thermostat manufacturer/model from HA's device registry (if we have a climate entity)

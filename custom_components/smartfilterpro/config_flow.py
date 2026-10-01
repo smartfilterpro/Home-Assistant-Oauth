@@ -22,8 +22,9 @@ from .const import (
     CONF_RESET_PATH, CONF_STATUS_URL, CONF_REFRESH_PATH,
     # tokens
     CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_EXPIRES_AT,
-    # environment toggle
-    CONF_USE_TEST_ENV, API_BASE_LIVE, API_BASE_TEST,
+    # environment
+    CONF_ENVIRONMENT, CONF_CORE_INGEST_URL, CONF_USE_TEST_ENV,
+    ENVIRONMENTS, ENV_PRODUCTION, ENV_DEV, DEFAULT_ENVIRONMENT,
     # defaults
     DEFAULT_LOGIN_PATH, DEFAULT_POST_PATH,
     DEFAULT_RESET_PATH, DEFAULT_STATUS_URL, DEFAULT_REFRESH_PATH,
@@ -82,11 +83,21 @@ def _climate_entity_ids(hass: HomeAssistant) -> list[str]:
         return []
 
 
-# User-facing login schema (email/password + optional test-environment toggle)
+# User-facing login schema: email/password plus the environment. The
+# environment picks BOTH the Bubble app and the Core service (see const.py);
+# almost everyone wants production, so it is the default and the dropdown is
+# the only place the others appear.
+ENVIRONMENT_OPTIONS = [
+    {"label": "Production", "value": ENV_PRODUCTION},
+    {"label": "Development (test)", "value": ENV_DEV},
+]
+
 STEP_LOGIN_SCHEMA = vol.Schema({
     vol.Required(CONF_EMAIL): str,
     vol.Required(CONF_PASSWORD): str,
-    vol.Optional(CONF_USE_TEST_ENV, default=False): bool,
+    vol.Optional(CONF_ENVIRONMENT, default=DEFAULT_ENVIRONMENT): selector({
+        "select": {"options": ENVIRONMENT_OPTIONS, "mode": "dropdown"}
+    }),
 })
 
 
@@ -109,10 +120,13 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         email = user_input[CONF_EMAIL].strip()
         password = user_input[CONF_PASSWORD]
-        use_test_env = bool(user_input.get(CONF_USE_TEST_ENV, False))
+        environment = user_input.get(CONF_ENVIRONMENT) or DEFAULT_ENVIRONMENT
+        if environment not in ENVIRONMENTS:
+            environment = DEFAULT_ENVIRONMENT
+        env = ENVIRONMENTS[environment]
 
         # Use defaults for all endpoints (not shown in UI)
-        api_base = (API_BASE_TEST if use_test_env else API_BASE_LIVE).rstrip("/")
+        api_base = env["api_base"].rstrip("/")
         login_path = DEFAULT_LOGIN_PATH.strip("/")
         post_path = DEFAULT_POST_PATH.strip("/")
         reset_path = DEFAULT_RESET_PATH.strip("/")
@@ -187,6 +201,8 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Stash login context
         self._login_ctx = {
             CONF_EMAIL: email,
+            CONF_ENVIRONMENT: environment,
+            CONF_CORE_INGEST_URL: env["core_ingest_url"],
             CONF_API_BASE: api_base,
             CONF_LOGIN_PATH: login_path,
             CONF_POST_PATH: post_path,
@@ -239,6 +255,9 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_HVAC_ID: hvac_id,
             CONF_HVAC_UID: hvac_id,
             "hvac_name": bubble_name,                   # <-- keep Bubble-friendly name
+            CONF_ENVIRONMENT: self._login_ctx[CONF_ENVIRONMENT],
+            CONF_CORE_INGEST_URL: self._login_ctx[CONF_CORE_INGEST_URL],
+            CONF_USE_TEST_ENV: self._login_ctx[CONF_ENVIRONMENT] != ENV_PRODUCTION,
             CONF_API_BASE: api_base,
             CONF_POST_PATH: self._login_ctx[CONF_POST_PATH],
             CONF_RESET_PATH: self._login_ctx[CONF_RESET_PATH],

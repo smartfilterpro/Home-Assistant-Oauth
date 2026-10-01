@@ -1,9 +1,9 @@
 {
   "domain": "smartfilterpro",
   "name": "SmartFilterPro",
-  "version": "0.0.4",
-  "documentation": "https://smartfilterpro.com/ha",
-  "issue_tracker": "https://github.com/your-org/smartfilterpro-ha/issues",
+  "version": "0.1.0",
+  "documentation": "https://github.com/smartfilterpro/Home-Assistant-Oauth",
+  "issue_tracker": "https://github.com/smartfilterpro/Home-Assistant-Oauth/issues",
   "config_flow": true,
   "requirements": [],
   "codeowners": ["@smartfilterpro"],
