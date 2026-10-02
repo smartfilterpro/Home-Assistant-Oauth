@@ -989,7 +989,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 cycle_end=now.isoformat(),
                 event_type="Mode_Change",
                 runtime_type="END",
-                previous_status=previous_status,
+                # previous_status comes from common_kwargs; naming it here as
+                # well raised "got multiple values for keyword argument" and
+                # aborted the handler, so active-to-active transitions
+                # (e.g. Heating -> Heating_Fan) never closed their segment and
+                # last_equipment_status never advanced, re-raising on every
+                # following event.
                 **common_kwargs,
             )
 
@@ -1051,7 +1056,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     async def _on_change(event):
         new = event.data.get("new_state")
         if new and (not climate_eid or new.entity_id == climate_eid):
-            await _handle_state(new)
+            try:
+                await _handle_state(new)
+            except Exception:  # noqa: BLE001 — one bad event must not become an unretrieved task error
+                _LOGGER.exception(
+                    "SFP: state change handler failed for %s (state=%s); this event was not posted",
+                    new.entity_id, new.state,
+                )
 
     # Only watch telemetry if a climate entity was chosen in the flow
     unsub_telemetry = None
@@ -1130,12 +1141,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             "unsub_outbox": unsub_outbox,
         }
     }
-    entry.async_on_unload(entry.add_update_listener(_reload))
+    # No update listener on purpose. The entry's data is rewritten on every
+    # token refresh (Bubble access token, Core token, the sensor's forced
+    # refresh), and a reload-on-update listener turned each of those into a
+    # full reload: every entity went unavailable and came back, the logbook
+    # recorded the button as "Pressed" each time it was re-created, and the
+    # in-memory runtime tracker and outbox were torn down mid-cycle. There is
+    # no options flow, so nothing legitimately needs a reload; every reader
+    # already re-fetches entry.data live.
     return True
-
-
-async def _reload(hass: HomeAssistant, entry: ConfigEntry):
-    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
