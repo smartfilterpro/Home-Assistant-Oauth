@@ -45,6 +45,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/test_environments.py
+      - run: python scripts/test_payload_calls.py
+      - run: pip install aiohttp && python scripts/test_auth.py
       - name: manifest version is semantic
         run: |
           v=$(python -c "import json;print(json.load(open('custom_components/smartfilterpro/manifest.json'))['version'])")

@@ -17,7 +17,7 @@ SmartFilterPro connects your smart thermostat to
 1. Make sure <a href="https://hacs.xyz" target="_blank" rel="noopener noreferrer">HACS</a> is installed in your Home Assistant.  
 2. Add this repository as a **custom repository** in HACS:
 
-   <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=smartfilterpro&repository=Home-Assistant-Oauth" target="_blank" rel="noopener noreferrer">
+   <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=smartfilterpro&repository=Home-Assistant-Oauth&category=integration" target="_blank" rel="noopener noreferrer">
      <img src="https://my.home-assistant.io/badges/hacs_repository.svg" alt="Add to HACS">
    </a>
 
