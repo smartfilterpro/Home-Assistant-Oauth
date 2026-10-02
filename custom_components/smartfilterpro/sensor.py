@@ -119,15 +119,10 @@ class SfpStatusCoordinator(DataUpdateCoordinator[dict]):
         self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
 
     async def _refresh_access_token(self) -> None:
-        # Force refresh regardless of skew check
+        # Force refresh regardless of skew check — one entry write, not the
+        # old back-date-expiry-then-ensure_valid two-step.
         auth = SfpAuth(self.hass, self.entry)
-        # simulate forced refresh by temporarily setting expiry
-        if auth.expires_at is not None:
-            new_data = dict(self.entry.data)
-            new_data[CONF_EXPIRES_AT] = int(time.time()) - 1
-            self.hass.config_entries.async_update_entry(self.entry, data=new_data)
-            self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
-        await auth.ensure_valid()
+        await auth.force_refresh()
         self.entry = self.hass.config_entries.async_get_entry(self.entry.entry_id)
 
     # --- main poll ---
