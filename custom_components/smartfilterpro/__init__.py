@@ -1,6 +1,7 @@
 # custom_components/smartfilterpro/__init__.py
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -31,14 +32,24 @@ from .const import (
     CONF_ACCESS_TOKEN,
 )
 from .auth import SfpAuth
+from .runtime import (
+    CHECKPOINT_INTERVAL,
+    attrs_is_active as _attrs_is_active,
+    classify_8_state as _classify_8_state,
+    classify_mode as _classify_mode,
+    clear_session,
+    confirm,
+    last_confirmed,
+    missed_change_times,
+    open_session,
+    parse_dt,
+    piece_event_id,
+    session_open,
+    take_piece,
+    unconfirmed_too_long,
+)
 
 _LOGGER = logging.getLogger(__name__)
-
-# Consider these hvac_action values to be "active"
-ACTIVE_ACTIONS = {"heating", "cooling", "fan"}
-
-# Fan modes that indicate air is moving even if hvac_action is "idle"
-FAN_ACTIVE_MODES = {"on", "on_high", "circulate"}
 
 ENTRY_VERSION = 2
 
@@ -47,9 +58,6 @@ ENTRY_VERSION = 2
 # hassfest requires this to be stated for integrations that define
 # async_setup.
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
-
-# Maximum reasonable runtime in seconds (24 hours)
-MAX_RUNTIME_SECONDS = 86400
 
 # ---- Outbox (failed-POST retry queue) tuning ----
 # Cap on pending entries; oldest is dropped (with a warning) on overflow.
@@ -70,9 +78,12 @@ class RuntimeTracker:
         self.hass = hass
         self._store = Store(hass, 1, f"smartfilterpro_{entry_id}_runtime")
         self.run_state = {
-            "active_since": None,          # datetime | None
+            "active_since": None,          # datetime | None — start of the open session
+            "reported_until": None,        # datetime | None — runtime posted up to here
+            "last_confirmed": None,        # datetime | None — HA last showed it running
+            "resumed": False,              # restored after a restart, not confirmed since (not persisted)
             "last_action": None,           # last hvac_action (may be 'idle')
-            "is_active": False,            # last computed active boolean
+            "is_active": False,            # a session is open (see runtime.session_open)
             "last_active_mode": None,      # 'heating' | 'cooling' | 'fanonly' | None
             "last_equipment_status": "Idle",  # 8-state system status
             "last_post_time": None,        # datetime of last post (for debounce)
@@ -80,29 +91,26 @@ class RuntimeTracker:
             "sequence_number": 0,          # monotonic event sequence counter
             "last_is_reachable": None,     # bool | None — tracks connectivity transitions
         }
-    
+
     async def load_state(self):
-        """Load persisted state, with validation for recent active cycles."""
+        """Load persisted state.
+
+        An open session is restored whatever its age; setup then resumes it
+        if HA confirmed it within UNCONFIRMED_LIMIT, or closes it at its last
+        confirmation (see _startup in async_setup_entry). The old rule dropped any session
+        older than an hour and seeded a new start at "now", losing everything
+        before the restart.
+        """
         try:
             data = await self._store.async_load() or {}
-            
-            # Restore active_since if it was recent (within last hour to handle restarts)
-            if "active_since_iso" in data:
-                try:
-                    stored_time = datetime.fromisoformat(data["active_since_iso"])
-                    time_diff = (datetime.now(timezone.utc) - stored_time).total_seconds()
-                    if 0 <= time_diff < 3600:  # Within last hour
-                        self.run_state["active_since"] = stored_time
-                        _LOGGER.debug("SFP: Restored active cycle from %s (%.1f min ago)", 
-                                    stored_time.isoformat(), time_diff / 60)
-                    else:
-                        _LOGGER.debug("SFP: Ignoring stale active cycle from %s (%.1f hours ago)", 
-                                    stored_time.isoformat(), time_diff / 3600)
-                except Exception as e:
-                    _LOGGER.warning("SFP: Failed to restore active_since: %s", e)
-            
-            # Restore other state
+
+            active_since = parse_dt(data.get("active_since_iso"))
             self.run_state.update({
+                "active_since": active_since,
+                # State saved before checkpoints existed has reported nothing,
+                # and its only confirmation on record is the session start.
+                "reported_until": parse_dt(data.get("reported_until_iso")) or active_since,
+                "last_confirmed": parse_dt(data.get("last_confirmed_iso")) or active_since,
                 "last_action": data.get("last_action"),
                 "is_active": bool(data.get("is_active", False)),
                 "last_active_mode": data.get("last_active_mode"),
@@ -110,6 +118,14 @@ class RuntimeTracker:
                 "sequence_number": int(data.get("sequence_number", 0)),
                 "last_is_reachable": data.get("last_is_reachable"),
             })
+            if self.run_state["is_active"] and active_since is None:
+                # is_active without a start time cannot be accounted for (it
+                # used to END with runtime 0, or runtime None on a status
+                # change). Treat it as closed; the current state starts anew.
+                _LOGGER.warning("SFP: Stored session had no start time; discarding it")
+                clear_session(self.run_state)
+            if not self.run_state["is_active"]:
+                clear_session(self.run_state)
 
         except Exception as e:
             _LOGGER.warning("SFP: Failed to load runtime state: %s", e)
@@ -126,7 +142,7 @@ class RuntimeTracker:
             seed = int(time.time() * 1000)
             self.run_state["sequence_number"] = seed
             _LOGGER.info("SFP: Seeding sequence counter from epoch-ms: %d", seed)
-    
+
     async def save_state(self):
         """Persist current runtime state."""
         try:
@@ -139,12 +155,24 @@ class RuntimeTracker:
                 "last_is_reachable": self.run_state.get("last_is_reachable"),
             }
 
-            if self.run_state.get("active_since"):
-                data["active_since_iso"] = self.run_state["active_since"].isoformat()
+            for key in ("active_since", "reported_until", "last_confirmed"):
+                if self.run_state.get(key):
+                    data[f"{key}_iso"] = self.run_state[key].isoformat()
 
             await self._store.async_save(data)
         except Exception as e:
             _LOGGER.warning("SFP: Failed to save runtime state: %s", e)
+
+    def raise_sequence_floor(self, floor: int) -> None:
+        """Never hand out a sequence number at or below `floor`.
+
+        Events are written to the outbox before the runtime state is saved,
+        so after a crash between the two the outbox can hold a number the
+        restored counter has not reached; reusing it would make Core drop
+        whichever copy arrives second.
+        """
+        if floor and floor > int(self.run_state.get("sequence_number") or 0):
+            self.run_state["sequence_number"] = int(floor)
 
     def should_skip_duplicate_post(self, equipment_status: str, event_type: str) -> bool:
         """Check if this post should be skipped as a duplicate (debounce)."""
@@ -181,15 +209,19 @@ class RuntimeTracker:
 
 
 class Outbox:
-    """Store-persisted queue of payloads whose POST to Core failed.
+    """Store-persisted log of payloads not yet acknowledged by Core.
 
-    A failed POST used to be logged and dropped, permanently burning the
-    event's already-consumed sequence number — Core's gap detector flagged
-    a gap that HA could never answer. Failed payloads now wait here (across
-    restarts, via the same HA Store mechanism as RuntimeTracker) and are
-    replayed UNCHANGED, so the original sequence_number and dedup keys
-    survive. Replay order doesn't matter to Core: its partial unique index
-    on (device_id, source_vendor, sequence_number) dedups retries, and its
+    Every event is written here (with its sequence number) BEFORE it is
+    posted, and removed once Core acknowledges it — the outbound-log rule
+    of @smartfilterpro/bridge-core, ported. If HA dies mid-POST the event is
+    still here after the restart and is replayed. A failed POST used to be
+    logged and dropped, permanently burning the event's already-consumed
+    sequence number — Core's gap detector flagged a gap that HA could never
+    answer. Pending payloads wait here (across restarts, via the same HA
+    Store mechanism as RuntimeTracker) and are replayed UNCHANGED, so the
+    original sequence_number and dedup keys survive. Replay order doesn't
+    matter to Core: its partial unique index on (device_id, source_vendor,
+    sequence_number) dedups retries, and its
     sequence tracker advances via GREATEST so out-of-order replays never
     regress the high-water mark.
 
@@ -228,25 +260,52 @@ class Outbox:
         except Exception as e:
             _LOGGER.warning("SFP: Failed to save outbox: %s", e)
 
-    def add(self, payload: dict):
-        """Queue a failed payload for retry (drop-oldest on overflow)."""
+    def add(self, payload: dict) -> dict:
+        """Log a payload before its POST (drop-oldest on overflow).
+
+        The first retry is OUTBOX_BACKOFF_STEPS[0] away, longer than a POST
+        can take, so the drain only picks it up if this attempt failed or
+        HA died during it.
+        """
         if len(self.entries) >= OUTBOX_MAX_ENTRIES:
-            dropped = self.entries.pop(0)
+            # Drop the oldest event that carries no runtime if there is one:
+            # a lost telemetry snapshot is replaced by the next, a lost
+            # runtime piece (checkpoint or END) is runtime Core never sees.
+            idx = next(
+                (i for i, e in enumerate(self.entries)
+                 if not ((e.get("payload") or {}).get("runtime_seconds") or 0) > 0),
+                0,
+            )
+            dropped = self.entries.pop(idx)
             _LOGGER.warning(
-                "SFP: Outbox full (%d entries); dropping oldest pending event "
-                "(sequence_number=%s)",
+                "SFP: Outbox full (%d entries); dropping pending event "
+                "(sequence_number=%s, runtime_seconds=%s)",
                 OUTBOX_MAX_ENTRIES,
                 (dropped.get("payload") or {}).get("sequence_number"),
+                (dropped.get("payload") or {}).get("runtime_seconds"),
             )
-        self.entries.append({
+        item = {
             "payload": payload,
             "attempts": 0,
             "next_attempt_at": time.time() + OUTBOX_BACKOFF_STEPS[0],
-        })
-        _LOGGER.info(
-            "SFP: Queued failed event in outbox (sequence_number=%s, %d pending)",
-            payload.get("sequence_number"), len(self.entries),
-        )
+        }
+        self.entries.append(item)
+        return item
+
+    def discard(self, item: dict) -> bool:
+        """Remove an entry Core acknowledged; False if it is already gone."""
+        for i, e in enumerate(self.entries):
+            if e is item:
+                del self.entries[i]
+                return True
+        return False
+
+    def max_sequence(self) -> int:
+        seqs = [
+            int((e.get("payload") or {}).get("sequence_number") or 0)
+            for e in self.entries
+        ]
+        return max(seqs, default=0)
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -259,8 +318,12 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _utcnow().isoformat()
 
 
 def _is_climate_available(state) -> bool:
@@ -268,133 +331,6 @@ def _is_climate_available(state) -> bool:
     if not state:
         return False
     return state.state not in {STATE_UNKNOWN, STATE_UNAVAILABLE, "unavailable", "unknown"}
-
-
-def _attrs_is_active(attrs: dict) -> bool:
-    """
-    Determine whether the system should be treated as 'active' (moving air).
-    Active if hvac_action is in ACTIVE_ACTIONS OR if hvac_action is idle
-    but the fan_mode indicates active circulation.
-    """
-    if not attrs:
-        return False
-    
-    hvac_action = attrs.get("hvac_action")
-    
-    # Primary check: explicit active actions
-    if hvac_action in ACTIVE_ACTIONS:
-        return True
-    
-    # Secondary check: only for idle state with active fan
-    if hvac_action == "idle":
-        fan_mode = attrs.get("fan_mode")
-        if isinstance(fan_mode, str):
-            fm = fan_mode.strip().lower()
-            return fm in FAN_ACTIVE_MODES
-    
-    # All other cases (including None, "off", etc.) are inactive
-    return False
-
-
-def _classify_mode(attrs: dict) -> str:
-    """
-    Return one of: 'heating', 'cooling', 'fanonly', 'idle'
-    """
-    if not attrs:
-        return "idle"
-
-    hvac_action = attrs.get("hvac_action")
-    fan_mode = attrs.get("fan_mode")
-
-    if hvac_action == "heating":
-        return "heating"
-    if hvac_action == "cooling":
-        return "cooling"
-    if hvac_action == "fan":
-        return "fanonly"
-
-    # If idle but fan is actively circulating, treat as fan-only airflow
-    if hvac_action == "idle" and isinstance(fan_mode, str):
-        fm = fan_mode.strip().lower()
-        if fm in FAN_ACTIVE_MODES:
-            return "fanonly"
-
-    return "idle"
-
-
-def _classify_8_state(attrs: dict, hvac_mode: str = None) -> str:
-    """
-    Classify thermostat state using 8-state system matching Hubitat:
-    Cooling_Fan, Cooling, Heating_Fan, Heating, AuxHeat_Fan, AuxHeat, Fan_only, Idle
-
-    HA Logic:
-      - hvac_action tells us what equipment is running
-      - fan_mode tells us if fan is explicitly on
-      - preset_mode or hvac_mode may indicate aux/emergency heat
-    """
-    if not attrs:
-        return "Idle"
-
-    hvac_action = (attrs.get("hvac_action") or "idle").lower()
-    fan_mode = (attrs.get("fan_mode") or "auto").lower()
-    preset_mode = (attrs.get("preset_mode") or "").lower()
-    hvac_mode_attr = (attrs.get("hvac_mode") or hvac_mode or "").lower()
-
-    cooling_active = hvac_action == "cooling"
-    heating_active = hvac_action == "heating"
-    fan_explicitly_on = fan_mode in ("on", "on_high", "circulate")
-    fan_only_mode = hvac_action == "fan"
-
-    # Check for auxiliary/emergency heat
-    # HA may indicate this in preset_mode or hvac_mode
-    is_aux_heat = (
-        "emergency" in preset_mode or
-        "aux" in preset_mode or
-        "emergency" in hvac_mode_attr or
-        hvac_mode_attr == "heat_cool" and "aux" in hvac_action
-    )
-
-    if is_aux_heat and heating_active and fan_explicitly_on:
-        return "AuxHeat_Fan"
-    elif is_aux_heat and heating_active:
-        return "AuxHeat"
-    elif cooling_active and fan_explicitly_on:
-        return "Cooling_Fan"
-    elif cooling_active:
-        return "Cooling"
-    elif heating_active and fan_explicitly_on:
-        return "Heating_Fan"
-    elif heating_active:
-        return "Heating"
-    elif fan_only_mode or fan_explicitly_on:
-        return "Fan_only"
-    else:
-        return "Idle"
-
-
-def _calculate_runtime_seconds(start_time: datetime, end_time: datetime) -> int:
-    """Calculate runtime with validation."""
-    if not start_time or not end_time:
-        return 0
-    
-    delta_seconds = int((end_time - start_time).total_seconds())
-    
-    # Validate runtime is reasonable
-    if delta_seconds < 0:
-        _LOGGER.warning(
-            "SFP: Negative runtime calculated: %s seconds (start=%s, end=%s)", 
-            delta_seconds, start_time.isoformat(), end_time.isoformat()
-        )
-        return 0
-    
-    if delta_seconds > MAX_RUNTIME_SECONDS:
-        _LOGGER.warning(
-            "SFP: Excessive runtime calculated: %s seconds (%.1f hours) - capping at %s seconds",
-            delta_seconds, delta_seconds / 3600, MAX_RUNTIME_SECONDS
-        )
-        return MAX_RUNTIME_SECONDS
-    
-    return delta_seconds
 
 
 def _discover_humidity_entity_id(hass: HomeAssistant, climate_eid: Optional[str]) -> Optional[str]:
@@ -500,13 +436,19 @@ def _build_payload(
     previous_status: Optional[str] = None,
     runtime_type: Optional[str] = None,
     humidity_fallback: Optional[float] = None,
+    timestamp: Optional[datetime] = None,
+    source_event_id: Optional[str] = None,
+    tz_name: Optional[str] = None,
 ) -> dict:
     """
     Payload shape expected by Core Ingest (matches Hubitat 8-state format).
     Posted to the Core URL of the entry's environment (see const.ENVIRONMENTS).
+
+    timestamp is the event time (default now). A runtime piece passes its
+    end, because Core reads it as timestamp - runtime_seconds .. timestamp.
     """
-    attrs = state.attributes if state else {}
-    ts = _now_iso()
+    attrs = (state.attributes if state else None) or {}
+    ts = (timestamp or _utcnow()).isoformat()
 
     # Get 8-state equipment status
     equipment_status = _classify_8_state(attrs, hvac_mode)
@@ -556,7 +498,9 @@ def _build_payload(
         "frontend_id": hvac_id,
         "firmware_version": None,
         "serial_number": None,
-        "timezone": "UTC",
+        # Home Assistant's configured zone. Core does not read it (it splits
+        # days by the devices row); kept for debugging.
+        "timezone": tz_name or "UTC",
 
         # 8-state equipment status fields (matching Hubitat)
         "last_mode": thermostat_mode,
@@ -584,6 +528,7 @@ def _build_payload(
         "runtime_seconds": runtime_seconds,
         "runtime_type": runtime_type,
         "previous_status": previous_status,
+        "source_event_id": source_event_id,
 
         # Timestamps
         "timestamp": ts,
@@ -671,6 +616,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     # Core cannot ask HA to backfill, so gap-free delivery depends on this).
     outbox = Outbox(hass, entry.entry_id)
     await outbox.load()
+    runtime_tracker.raise_sequence_floor(outbox.max_sequence())
 
     async def _post_to_core(payload: dict, is_retry: bool = False) -> bool:
         """Post telemetry directly to Railway Core using Core JWT token."""
@@ -725,17 +671,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _LOGGER.error("SFP Core POST error: %s", e)
             return False
 
-    async def _post(payload: dict) -> None:
-        """Post telemetry to Railway Core; queue in the outbox on failure.
+    async def _send(payload: dict) -> None:
+        """Number, log, then post one event to Core.
 
-        _post_to_core has already done its own 401-refresh retry by the time
-        it returns False, so anything that lands here failed for real. The
-        payload's sequence number was consumed before the POST, so dropping
-        it would leave a gap Core can never backfill — queue it instead.
+        Bridge-core's delivery order, ported: allocate the sequence number,
+        write the event to the outbox and save the counter BEFORE the POST,
+        and drop it from the outbox only once Core acknowledges it. If HA
+        dies mid-POST, or the POST fails, the event is replayed unchanged by
+        the drain (same sequence_number and source_event_id, so Core dedupes
+        a copy it already has). _post_to_core has already done its own
+        401-refresh retry by the time it returns False.
         """
-        if not await _post_to_core(payload):
-            outbox.add(payload)
-            await outbox.save()
+        payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
+        item = outbox.add(payload)
+        await outbox.save()
+        await runtime_tracker.save_state()
+        if await _post_to_core(payload):
+            if outbox.discard(item):
+                await outbox.save()
+            return
+        _LOGGER.info(
+            "SFP: Core POST failed; event kept in outbox for retry (sequence_number=%s, %d pending)",
+            payload.get("sequence_number"), len(outbox.entries),
+        )
 
     async def _drain_outbox(_now=None) -> None:
         """Retry queued payloads whose backoff has elapsed.
@@ -754,7 +712,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         for item in due:
             payload = item["payload"]
             if await _post_to_core(payload):
-                outbox.entries.remove(item)
+                outbox.discard(item)
                 changed = True
                 _LOGGER.info(
                     "SFP: Outbox replay succeeded (sequence_number=%s, %d remaining)",
@@ -764,7 +722,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             item["attempts"] = item.get("attempts", 0) + 1
             changed = True
             if item["attempts"] >= OUTBOX_MAX_ATTEMPTS:
-                outbox.entries.remove(item)
+                outbox.discard(item)
                 _LOGGER.error(
                     "SFP: Dropping outbox event after %d failed attempts "
                     "(sequence_number=%s) — Core will see a permanent gap",
@@ -786,104 +744,173 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         hass, _drain_outbox, timedelta(seconds=OUTBOX_DRAIN_INTERVAL_SECONDS)
     )
 
-    async def _handle_state(new_state) -> None:
-        """Send payload on every climate state change; mark cycle start/stop."""
+    # State changes, checkpoints and startup recovery all read and write the
+    # same session; run them one at a time (each awaits network I/O).
+    session_lock = asyncio.Lock()
+    tz_name = getattr(getattr(hass, "config", None), "time_zone", None)
+
+    def _device_kwargs(state) -> dict:
+        return dict(
+            user_id=user_id,
+            hvac_id=hvac_id,
+            entity_id=state.entity_id if state else climate_eid,
+            device_name=state.name if state else None,
+            thermostat_manufacturer=device_meta.get("manufacturer"),
+            thermostat_model=device_meta.get("model"),
+            tz_name=tz_name,
+        )
+
+    async def _close_session(state, at: datetime, reason: str, *, reachable: bool) -> None:
+        """END the open session at `at`, carrying only runtime not yet posted.
+
+        `at` is the last confirmation for a close HA could not confirm (the
+        entity went unavailable, a restart, an hour without confirmation),
+        so unconfirmed time is never counted.
+        """
+        rs = runtime_tracker.run_state
+        previous_status = rs.get("last_equipment_status", "Idle")
+        piece = take_piece(rs, at, allow_empty=True)
+        clear_session(rs)
+        if piece is None:
+            return
+        end_payload = _build_payload(
+            state,
+            hvac_mode=state.state if state else None,
+            runtime_seconds=piece["runtime_seconds"],
+            cycle_start=piece["session_start"].isoformat(),
+            cycle_end=piece["end"].isoformat(),
+            connected=reachable,
+            is_reachable=reachable,
+            event_type="Mode_Change",
+            previous_status=previous_status,
+            runtime_type="END",
+            humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
+            timestamp=piece["end"],
+            source_event_id=piece_event_id(hvac_id, piece, "end"),
+            **_device_kwargs(state),
+        )
+        await _send(end_payload)
+        runtime_tracker.record_post(previous_status)
+        _LOGGER.info(
+            "SFP: Closed %s session (%s) at %s; final piece %ss",
+            previous_status, reason, piece["end"].isoformat(), piece["runtime_seconds"],
+        )
+
+    async def _post_checkpoint(state, now: datetime) -> None:
+        """Post the confirmed-running session's runtime since the last report."""
+        rs = runtime_tracker.run_state
+        piece = take_piece(rs, now)
+        if piece is None:
+            await runtime_tracker.save_state()
+            return
+        status = piece["status"]
+        payload = _build_payload(
+            state,
+            hvac_mode=state.state,
+            runtime_seconds=piece["runtime_seconds"],
+            cycle_start=piece["session_start"].isoformat(),
+            cycle_end=piece["end"].isoformat(),
+            connected=True,
+            is_reachable=True,
+            event_type="Telemetry_Update",
+            previous_status=status,
+            runtime_type="CHECKPOINT",
+            humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
+            timestamp=piece["end"],
+            source_event_id=piece_event_id(hvac_id, piece, "checkpoint"),
+            **_device_kwargs(state),
+        )
+        await _send(payload)
+        runtime_tracker.record_post(status)
+        _LOGGER.debug("SFP: Checkpoint %s +%ss", status, piece["runtime_seconds"])
+
+    async def _handle_state(new_state, *, end_at: Optional[datetime] = None,
+                            start_at: Optional[datetime] = None) -> None:
+        """Send payload on every climate state change; mark cycle start/stop.
+
+        end_at/start_at say when a change took effect if the listener did not
+        see it happen (the checkpoint timer or startup found it); live state
+        changes take effect now.
+        """
+        rs = runtime_tracker.run_state
+        now = _utcnow()
+        if end_at is None and session_open(rs) and rs.get("resumed"):
+            # First change seen for a session restored after a restart: what
+            # ran while HA was down is unknown, so a different state ends the
+            # old one at its last confirmation, not now.
+            end_at, start_at = missed_change_times(rs, None, now)
+        end_at = end_at or now
+        start_at = start_at or now
+
         if not _is_climate_available(new_state):
             _LOGGER.debug("SFP: Device unavailable, posting is_reachable=false: %s",
                           new_state.state if new_state else "None")
+            previous_status = rs.get("last_equipment_status", "Idle")
 
-            # If there was an active cycle running, close it before reporting offline
-            was_active = bool(runtime_tracker.run_state.get("is_active"))
-            now = datetime.now(timezone.utc)
-            previous_status = runtime_tracker.run_state.get("last_equipment_status", "Idle")
-
-            if was_active:
-                start = runtime_tracker.run_state.get("active_since")
-                secs = _calculate_runtime_seconds(start, now)
-                end_payload = _build_payload(
-                    new_state,
-                    user_id=user_id,
-                    hvac_id=hvac_id,
-                    entity_id=new_state.entity_id if new_state else climate_eid,
-                    hvac_mode=new_state.state if new_state else None,
-                    runtime_seconds=secs,
-                    cycle_start=start.isoformat() if start else None,
-                    cycle_end=now.isoformat(),
-                    connected=False,
-                    is_reachable=False,
-                    device_name=new_state.name if new_state else None,
-                    thermostat_manufacturer=device_meta.get("manufacturer"),
-                    thermostat_model=device_meta.get("model"),
-                    event_type="Mode_Change",
-                    previous_status=previous_status,
-                    runtime_type="END",
-                    humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
-                )
-                end_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
-                await _post(end_payload)
-                runtime_tracker.record_post(previous_status)
-                runtime_tracker.run_state["active_since"] = None
-                runtime_tracker.run_state["is_active"] = False
-                _LOGGER.info("SFP: Closed active cycle (device unreachable); duration=%ss", secs)
+            # Nothing can confirm an open run while the entity is unavailable:
+            # close it at its last confirmation, not now. If it comes back
+            # running, that starts a new session.
+            if session_open(rs):
+                await _close_session(new_state, last_confirmed(rs), "device unavailable", reachable=False)
 
             # Post explicit offline/unreachable event so Core knows
             offline_payload = _build_payload(
                 new_state,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=new_state.entity_id if new_state else climate_eid,
                 hvac_mode=new_state.state if new_state else None,
                 connected=False,
                 is_reachable=False,
-                device_name=new_state.name if new_state else None,
-                thermostat_manufacturer=device_meta.get("manufacturer"),
-                thermostat_model=device_meta.get("model"),
                 event_type="CONNECTIVITY_CHANGE",
                 previous_status=previous_status,
                 humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
+                **_device_kwargs(new_state),
             )
-            offline_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
-            await _post(offline_payload)
+            await _send(offline_payload)
             runtime_tracker.record_post("Idle")
-            runtime_tracker.run_state["last_is_reachable"] = False
+            rs["last_is_reachable"] = False
             await runtime_tracker.save_state()
             return
 
         # Detect offline → online transition and send CONNECTIVITY_CHANGE
-        was_reachable = runtime_tracker.run_state.get("last_is_reachable")
+        was_reachable = rs.get("last_is_reachable")
         if was_reachable is False:
             _LOGGER.info("SFP: Device back online, sending CONNECTIVITY_CHANGE (is_reachable=true)")
             online_payload = _build_payload(
                 new_state,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=new_state.entity_id,
                 hvac_mode=new_state.state,
                 connected=True,
                 is_reachable=True,
-                device_name=new_state.name,
-                thermostat_manufacturer=device_meta.get("manufacturer"),
-                thermostat_model=device_meta.get("model"),
                 event_type="CONNECTIVITY_CHANGE",
-                previous_status=runtime_tracker.run_state.get("last_equipment_status", "Idle"),
+                previous_status=rs.get("last_equipment_status", "Idle"),
                 humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
+                **_device_kwargs(new_state),
             )
-            online_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
-            await _post(online_payload)
+            await _send(online_payload)
             runtime_tracker.record_post("Idle")
 
-        runtime_tracker.run_state["last_is_reachable"] = True
+        rs["last_is_reachable"] = True
 
         attrs = (new_state.attributes or {})
         hvac_mode = new_state.state  # Current thermostat mode (heat/cool/auto/off)
         hvac_action = attrs.get("hvac_action")
         classified_mode = _classify_mode(attrs)  # 'heating' | 'cooling' | 'fanonly' | 'idle'
-        is_active = _attrs_is_active(attrs)
-        was_active = bool(runtime_tracker.run_state.get("is_active"))
 
-        # Get 8-state equipment status for Core payload
+        # Get 8-state equipment status for Core payload. Running means "not
+        # Idle" — the same rule the payload uses, so a fan-only run (fan on
+        # with hvac_action idle/off/missing) is tracked, not just labelled.
         equipment_status = _classify_8_state(attrs, hvac_mode)
-        previous_status = runtime_tracker.run_state.get("last_equipment_status", "Idle")
+        is_active = equipment_status != "Idle"
+
+        # An open session nothing confirmed for over UNCONFIRMED_LIMIT (HA's
+        # loop stalled, or restored after a long restart): close it at its
+        # last confirmation. If it is running now, that is a new session.
+        if unconfirmed_too_long(rs, now):
+            await _close_session(new_state, last_confirmed(rs), "unconfirmed", reachable=True)
+            end_at = start_at = now
+
+        was_active = session_open(rs)
+        if not was_active:
+            clear_session(rs)
+        previous_status = rs.get("last_equipment_status", "Idle")
 
         _LOGGER.debug(
             "SFP state change: entity=%s, hvac_action=%s, fan_mode=%s, "
@@ -899,36 +926,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
         # Maintain last_active_mode so we can report lastMode even while idle
         if classified_mode in ("heating", "cooling", "fanonly"):
-            runtime_tracker.run_state["last_active_mode"] = classified_mode
+            rs["last_active_mode"] = classified_mode
 
         payload = None
-        now = datetime.now(timezone.utc)
 
         # Pre-resolve humidity fallback once per state change so every payload
         # this handler emits sees the same value.
         humidity_fallback = _read_humidity_from_entity(hass, humidity_entity_id)
 
         common_kwargs = dict(
-            thermostat_manufacturer=device_meta.get("manufacturer"),
-            thermostat_model=device_meta.get("model"),
-            connected=_is_climate_available(new_state),
-            device_name=new_state.name,
-            last_mode=runtime_tracker.run_state.get("last_active_mode") if classified_mode == "idle" else classified_mode,
-            is_reachable=_is_climate_available(new_state),
+            connected=True,
+            last_mode=rs.get("last_active_mode") if classified_mode == "idle" else classified_mode,
+            is_reachable=True,
             previous_status=previous_status,
             humidity_fallback=humidity_fallback,
+            **_device_kwargs(new_state),
         )
 
         if not was_active and is_active:
             # cycle start
-            runtime_tracker.run_state["active_since"] = now
+            open_session(rs, start_at, equipment_status)
             payload = _build_payload(
                 new_state,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=new_state.entity_id,
                 hvac_mode=hvac_mode,
                 event_type="Mode_Change",
+                timestamp=start_at,
                 **common_kwargs,
             )
             _LOGGER.info(
@@ -937,108 +959,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             )
 
         elif was_active and not is_active:
-            # cycle end
-            start = runtime_tracker.run_state.get("active_since")
-            secs = _calculate_runtime_seconds(start, now)
+            # cycle end: the END carries only the runtime since the last
+            # checkpoint (see runtime.py)
+            await _close_session(new_state, end_at, "cycle end", reachable=True)
 
-            # For cycle-end, lastMode should reflect the *last active* mode
-            lm = runtime_tracker.run_state.get("last_active_mode") or (
-                classified_mode if classified_mode in ("heating", "cooling", "fanonly") else None
-            )
+        elif was_active and equipment_status != previous_status:
+            # Active-to-active status change (e.g. Heating -> Heating_Fan):
+            # END the old status with its unreported runtime (previous_status
+            # = old), then open a session for the new one. Core joins the two
+            # when they are the same mode.
+            await _close_session(new_state, end_at, f"status change to {equipment_status}", reachable=True)
+            open_session(rs, start_at, equipment_status)
             payload = _build_payload(
                 new_state,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=new_state.entity_id,
-                hvac_mode=hvac_mode,
-                runtime_seconds=secs,
-                cycle_start=start.isoformat() if start else None,
-                cycle_end=now.isoformat(),
-                last_mode=lm,
-                is_reachable=_is_climate_available(new_state),
-                thermostat_manufacturer=device_meta.get("manufacturer"),
-                thermostat_model=device_meta.get("model"),
-                connected=_is_climate_available(new_state),
-                device_name=new_state.name,
-                event_type="Mode_Change",
-                previous_status=previous_status,
-                runtime_type="END",
-                humidity_fallback=humidity_fallback,
-            )
-            runtime_tracker.run_state["active_since"] = None
-            _LOGGER.info(
-                "SFP cycle end detected; duration=%ss (%.1f min) equipment_status=%s previous=%s",
-                secs, secs / 60, equipment_status, previous_status
-            )
-
-        elif equipment_status != previous_status and is_active:
-            # Active-to-active status change (e.g., Cooling → Heating)
-            # End the previous segment with runtime, then start a new one
-            start = runtime_tracker.run_state.get("active_since")
-            secs = _calculate_runtime_seconds(start, now) if start else None
-
-            # Send Mode_Change event to close the previous segment
-            end_payload = _build_payload(
-                new_state,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=new_state.entity_id,
-                hvac_mode=hvac_mode,
-                runtime_seconds=secs,
-                cycle_start=start.isoformat() if start else None,
-                cycle_end=now.isoformat(),
-                event_type="Mode_Change",
-                runtime_type="END",
-                # previous_status comes from common_kwargs; naming it here as
-                # well raised "got multiple values for keyword argument" and
-                # aborted the handler, so active-to-active transitions
-                # (e.g. Heating -> Heating_Fan) never closed their segment and
-                # last_equipment_status never advanced, re-raising on every
-                # following event.
-                **common_kwargs,
-            )
-
-            _LOGGER.info(
-                "SFP active status change: %s (%ss) → %s",
-                previous_status, secs, equipment_status
-            )
-
-            end_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
-            await _post(end_payload)
-            runtime_tracker.record_post(previous_status)
-
-            # Start a new segment for the new active state
-            runtime_tracker.run_state["active_since"] = now
-
-            # Send Telemetry_Update for the new state
-            payload = _build_payload(
-                new_state,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=new_state.entity_id,
                 hvac_mode=hvac_mode,
                 event_type="Telemetry_Update",
                 **common_kwargs,
             )
 
         else:
-            # steady-state ping (telemetry update) — no status change
+            # steady-state ping (telemetry update) — no status change. An
+            # available entity still showing the same run confirms it.
+            if was_active:
+                confirm(rs, now)
             payload = _build_payload(
                 new_state,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=new_state.entity_id,
                 hvac_mode=hvac_mode,
                 event_type="Telemetry_Update",
                 **common_kwargs,
             )
 
         # Update last equipment status for next comparison
-        runtime_tracker.run_state["last_equipment_status"] = equipment_status
+        rs["last_equipment_status"] = equipment_status
 
         # Update last seen values
-        runtime_tracker.run_state["last_action"] = hvac_action
-        runtime_tracker.run_state["is_active"] = is_active
+        rs["last_action"] = hvac_action
 
         # Save state after each change
         await runtime_tracker.save_state()
@@ -1049,53 +1004,110 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             if runtime_tracker.should_skip_duplicate_post(equipment_status, event_type):
                 return
 
-            payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
-            await _post(payload)
+            await _send(payload)
             runtime_tracker.record_post(equipment_status)
+
+    async def _check_session() -> None:
+        """Confirm an open session with HA's current state (every CHECKPOINT_INTERVAL).
+
+        - still running the same way: post a CHECKPOINT for the runtime since
+          the last report;
+        - stopped or changed (a change the listener never handled): handle
+          it like that state change;
+        - unavailable/unknown: not confirmed; past UNCONFIRMED_LIMIT, close
+          at the last confirmation.
+        """
+        rs = runtime_tracker.run_state
+        now = _utcnow()
+        st = hass.states.get(climate_eid)
+
+        if not _is_climate_available(st):
+            if unconfirmed_too_long(rs, now):
+                await _close_session(st, last_confirmed(rs), "unconfirmed", reachable=False)
+                await runtime_tracker.save_state()
+            return
+
+        status = _classify_8_state(st.attributes or {}, st.state)
+        running = status != "Idle"
+        if (session_open(rs) and running and status == rs.get("last_equipment_status")
+                and not unconfirmed_too_long(rs, now)):
+            confirm(rs, now)
+            await _post_checkpoint(st, now)
+            return
+
+        if session_open(rs) or running:
+            end_at, start_at = missed_change_times(rs, getattr(st, "last_updated", None), now)
+            _LOGGER.info(
+                "SFP: Checkpoint found %s while tracking %s; applying the missed change",
+                status, rs.get("last_equipment_status") if session_open(rs) else "Idle",
+            )
+            await _handle_state(st, end_at=end_at, start_at=start_at)
+
+    async def _checkpoint_tick(_now=None) -> None:
+        async with session_lock:
+            try:
+                await _check_session()
+            except Exception:  # noqa: BLE001 — keep the timer alive
+                _LOGGER.exception("SFP: runtime checkpoint failed")
 
     async def _on_change(event):
         new = event.data.get("new_state")
         if new and (not climate_eid or new.entity_id == climate_eid):
-            try:
-                await _handle_state(new)
-            except Exception:  # noqa: BLE001 — one bad event must not become an unretrieved task error
-                _LOGGER.exception(
-                    "SFP: state change handler failed for %s (state=%s); this event was not posted",
-                    new.entity_id, new.state,
+            async with session_lock:
+                try:
+                    await _handle_state(new)
+                except Exception:  # noqa: BLE001 — one bad event must not become an unretrieved task error
+                    _LOGGER.exception(
+                        "SFP: state change handler failed for %s (state=%s); this event was not posted",
+                        new.entity_id, new.state,
+                    )
+
+    async def _startup() -> None:
+        """Recover a session saved before a restart, then prime an initial send.
+
+        Resume it (checkpoints continue from "reported up to") if HA
+        confirmed it within UNCONFIRMED_LIMIT; otherwise close it at its last
+        confirmation. The old rule seeded a fresh start at "now" for anything
+        older than an hour, losing everything before the restart.
+        """
+        rs = runtime_tracker.run_state
+        now = _utcnow()
+        st = hass.states.get(climate_eid)
+        if session_open(rs):
+            if unconfirmed_too_long(rs, now):
+                await _close_session(st, last_confirmed(rs), "restart after more than an hour",
+                                     reachable=_is_climate_available(st))
+            else:
+                rs["resumed"] = True
+                _LOGGER.info(
+                    "SFP: Resuming %s session from before the restart (reported up to %s)",
+                    rs.get("last_equipment_status"), rs["reported_until"].isoformat(),
                 )
+
+        if st and _is_climate_available(st):
+            # Seed reachability so the initial _handle_state doesn't
+            # fire a spurious CONNECTIVITY_CHANGE on first boot
+            if rs.get("last_is_reachable") is None:
+                rs["last_is_reachable"] = True
+            end_at, start_at = missed_change_times(rs, getattr(st, "last_updated", None), now)
+            await _handle_state(st, end_at=end_at, start_at=start_at)
+        else:
+            # The checkpoint timer keeps checking; an open session is closed
+            # at its last confirmation if the entity stays unavailable.
+            await runtime_tracker.save_state()
 
     # Only watch telemetry if a climate entity was chosen in the flow
     unsub_telemetry = None
+    unsub_checkpoint = None
     if climate_eid:
         _LOGGER.debug("SFP telemetry watching %s", climate_eid)
         unsub_telemetry = async_track_state_change_event(hass, [climate_eid], _on_change)
-
-        # Prime an initial send
-        st = hass.states.get(climate_eid)
-        if st and _is_climate_available(st):
-            attrs = st.attributes or {}
-            classified_mode = _classify_mode(attrs)
-            equipment_status = _classify_8_state(attrs, st.state)
-            if classified_mode in ("heating", "cooling", "fanonly"):
-                # Seed last_active_mode if we started mid-cycle
-                runtime_tracker.run_state["last_active_mode"] = classified_mode
-            runtime_tracker.run_state["last_action"] = attrs.get("hvac_action")
-            runtime_tracker.run_state["last_equipment_status"] = equipment_status
-            current_active = _attrs_is_active(attrs)
-            runtime_tracker.run_state["is_active"] = current_active
-            # Seed reachability so the initial _handle_state doesn't
-            # fire a spurious CONNECTIVITY_CHANGE on first boot
-            if runtime_tracker.run_state.get("last_is_reachable") is None:
-                runtime_tracker.run_state["last_is_reachable"] = True
-
-            # If we restored an active_since from storage, don't overwrite it
-            if runtime_tracker.run_state["active_since"] is None and current_active:
-                # If HA/integration just started mid-cycle, true start is unknown; seed to now.
-                runtime_tracker.run_state["active_since"] = datetime.now(timezone.utc)
-                _LOGGER.info("SFP: Started mid-cycle, seeding active_since to now")
-
-            await runtime_tracker.save_state()
-            await _handle_state(st)
+        unsub_checkpoint = async_track_time_interval(hass, _checkpoint_tick, CHECKPOINT_INTERVAL)
+        async with session_lock:
+            try:
+                await _startup()
+            except Exception:  # noqa: BLE001 — setup must still finish
+                _LOGGER.exception("SFP: runtime recovery at startup failed")
     else:
         _LOGGER.debug("SFP telemetry disabled (no climate entity chosen)")
 
@@ -1113,21 +1125,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             previous_status = runtime_tracker.run_state.get("last_equipment_status", "Idle")
             send_now_payload = _build_payload(
                 s,
-                user_id=user_id,
-                hvac_id=hvac_id,
-                entity_id=climate_eid,
                 connected=_is_climate_available(s),
-                device_name=s.name,
-                thermostat_manufacturer=device_meta.get("manufacturer"),
-                thermostat_model=device_meta.get("model"),
                 last_mode=lm,
                 is_reachable=_is_climate_available(s),
                 event_type="Telemetry_Update",
                 previous_status=previous_status,
                 humidity_fallback=_read_humidity_from_entity(hass, humidity_entity_id),
+                **_device_kwargs(s),
             )
-            send_now_payload["sequence_number"] = runtime_tracker.get_and_increment_sequence()
-            await _post(send_now_payload)
+            await _send(send_now_payload)
 
     hass.services.async_register(DOMAIN, "send_now", _svc_send_now)
 
@@ -1139,6 +1145,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             "runtime_tracker": runtime_tracker,
             "outbox": outbox,
             "unsub_outbox": unsub_outbox,
+            "unsub_checkpoint": unsub_checkpoint,
         }
     }
     # No update listener on purpose. The entry's data is rewritten on every
@@ -1162,12 +1169,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
             except Exception:
                 pass
 
-        unsub_outbox = data[STORAGE_KEY].get("unsub_outbox")
-        if unsub_outbox:
-            try:
-                unsub_outbox()
-            except Exception:
-                pass
+        for key in ("unsub_outbox", "unsub_checkpoint"):
+            unsub_timer = data[STORAGE_KEY].get(key)
+            if unsub_timer:
+                try:
+                    unsub_timer()
+                except Exception:
+                    pass
 
         # Save final state before unloading
         runtime_tracker = data[STORAGE_KEY].get("runtime_tracker")

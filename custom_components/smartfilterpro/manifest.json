@@ -11,5 +11,5 @@
   "issue_tracker": "https://github.com/smartfilterpro/Home-Assistant-Oauth/issues",
   "loggers": ["custom_components.smartfilterpro"],
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
