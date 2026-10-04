@@ -109,6 +109,4 @@ TOKEN_SKEW_SECONDS = 300
 # Core token refresh buffer (refresh 60 seconds before expiry)
 CORE_TOKEN_SKEW_SECONDS = 60
 
-# Runtime calculation constants
-MAX_RUNTIME_SECONDS = 86400  # 24 hours maximum reasonable runtime
-RUNTIME_PERSIST_WINDOW = 3600  # 1 hour - restore active cycles within this window after restart
+# Runtime timing (checkpoint interval, unconfirmed limit) lives in runtime.py.
