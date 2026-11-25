@@ -68,8 +68,13 @@ check("hacs.json hides the default branch so only releases are installable", hac
 check("hacs.json declares a minimum Home Assistant version", bool(hacs.get("homeassistant")))
 
 translations = json.loads((COMPONENT / "translations" / "en.json").read_text())
-check("login form has a label for the environment field",
-      "environment" in translations["config"]["step"]["user"]["data"])
+check("the environment picker (pick_implementation) has a label",
+      "implementation" in translations["config"]["step"]["pick_implementation"]["data"])
+check("Sign in with SmartFilterPro uses each environment's own Bubble app",
+      const.HUB_CONNECT_PATH == "/hub_connect" and const.HUB_TOKEN_PATH == "/api/1.1/wf/hub_token"
+      and const.OAUTH_CLIENT_ID == "home_assistant")
+check("the email + password sign-in is gone", not hasattr(const, "DEFAULT_LOGIN_PATH")
+      and "password" not in json.dumps(translations).lower())
 
 print("\nAll checks passed" if failures == 0 else f"\n{failures} check(s) failed")
 sys.exit(0 if failures == 0 else 1)

@@ -1,38 +1,45 @@
 {
   "config": {
     "step": {
-      "user": {
-        "title": "SmartFilterPro — Sign In",
-        "description": "Enter your SmartFilterPro email and password to link your account.",
+      "pick_implementation": {
+        "title": "SmartFilterPro — Choose where to sign in",
+        "description": "Choose SmartFilterPro. The development option is only for testing when SmartFilterPro support asks you to.",
         "data": {
-          "email": "Email address",
-          "password": "Password",
-          "environment": "Environment"
-        },
-        "data_description": {
-          "environment": "Leave on Production unless SmartFilterPro support asked you to test a development build."
+          "implementation": "Sign in to"
         }
+      },
+      "auth": {
+        "title": "Sign in with SmartFilterPro",
+        "description": "A SmartFilterPro page opens. Sign in the way you do in the SmartFilterPro app (Apple, Google or email), then choose Allow."
       },
       "hvac": {
         "title": "Select Thermostat",
-        "description": "Multiple SmartFilterPro devices were found. Choose which HVAC to link.",
-        "data": { "hvac_id": "Thermostat" }
+        "description": "Your SmartFilterPro account has several Home Assistant thermostats. Choose the one to link.",
+        "data": {
+          "hvac_id": "Thermostat"
+        }
       },
       "climate": {
         "title": "Choose Thermostat Entity",
         "description": "Pick the Home Assistant climate entity to forward to SmartFilterPro.",
-        "data": { "climate_entity_id": "Thermostat (climate.*)" }
+        "data": {
+          "climate_entity_id": "Thermostat (climate.*)"
+        }
       }
     },
-    "error": {
-      "required": "Required",
-      "cannot_connect": "Could not connect. Check server/workflow.",
-      "not_found": "We could not find a thermostat for this account.",
-      "no_climate": "No climate entities found in Home Assistant.",
-      "unknown": "Unexpected response from SmartFilterPro."
-    },
     "abort": {
-      "no_thermostats_found": "No thermostats are linked to this SmartFilterPro account."
+      "no_thermostats_found": "Your SmartFilterPro account has no Home Assistant thermostat yet. Add one in the SmartFilterPro app, then add this integration again.",
+      "already_configured": "This SmartFilterPro thermostat is already set up in Home Assistant.",
+      "oauth_error": "SmartFilterPro returned an incomplete sign-in. Try again.",
+      "oauth_failed": "SmartFilterPro didn't accept the sign-in. Try again; if it keeps happening, check the Home Assistant log for the reason.",
+      "oauth_timeout": "SmartFilterPro took too long to answer. Try again.",
+      "oauth_unauthorized": "SmartFilterPro refused the sign-in. Try again.",
+      "oauth_implementation_unavailable": "Sign in with SmartFilterPro is unavailable right now. Try again later.",
+      "authorize_url_timeout": "Timed out preparing the sign-in page. Try again.",
+      "missing_configuration": "Sign in with SmartFilterPro isn't set up in this version of the integration. Reinstall it from HACS.",
+      "missing_credentials": "Sign in with SmartFilterPro isn't set up in this version of the integration. Reinstall it from HACS.",
+      "no_url_available": "Home Assistant has no address SmartFilterPro can send you back to. Turn on My Home Assistant (included in the default configuration) and try again. More: {docs_url}",
+      "user_rejected_authorize": "The sign-in was cancelled on SmartFilterPro ({error})."
     }
   }
 }

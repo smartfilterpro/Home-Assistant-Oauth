@@ -61,11 +61,7 @@ CONF_USER_ID = "user_id"
 CONF_HVAC_ID = "hvac_id"            # selected HVAC id (we also send in body as hvac_uid)
 CONF_HVAC_UID = "hvac_uid"          # canonical unique id if/when you have it
 
-CONF_EMAIL = "email"
-CONF_PASSWORD = "password"
-
 CONF_API_BASE = "api_base"
-CONF_LOGIN_PATH = "login_path"
 CONF_POST_PATH = "post_path"
 CONF_RESET_PATH = "reset_path"
 CONF_STATUS_URL = "status_url"
@@ -96,12 +92,20 @@ API_BASE_TEST = ENVIRONMENTS[ENV_DEV]["api_base"]
 
 # ==== Defaults ====
 DEFAULT_API_BASE = API_BASE_LIVE
-DEFAULT_LOGIN_PATH = "/api/1.1/wf/ha_password_login"
 DEFAULT_POST_PATH = "/api/1.1/wf/ha_telemetry"
 DEFAULT_RESET_PATH = "/api/1.1/wf/ha_reset_filter"
 DEFAULT_STATUS_URL = "/api/1.1/wf/ha_therm_status"
 DEFAULT_REFRESH_PATH = "/api/1.1/wf/ha_refresh_token"
 DEFAULT_CORE_JWT_PATH = "/api/1.1/wf/issue_core_token_ha"
+
+# ==== Sign in with SmartFilterPro (OAuth + PKCE, see oauth.py) ====
+# The only way to link an account: the email + password sign-in
+# (ha_password_login) was removed in 0.3.0. hub_connect is the Bubble page
+# the user signs in on; hub_token swaps the one-time code for tokens. Both
+# are relative to the environment's api_base.
+OAUTH_CLIENT_ID = "home_assistant"
+HUB_CONNECT_PATH = "/hub_connect"
+HUB_TOKEN_PATH = "/api/1.1/wf/hub_token"
 
 # Refresh 5 minutes before expiry to avoid clock skew
 TOKEN_SKEW_SECONDS = 300
