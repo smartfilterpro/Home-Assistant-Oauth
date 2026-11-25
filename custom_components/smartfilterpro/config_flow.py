@@ -1,43 +1,53 @@
 # custom_components/smartfilterpro/config_flow.py
+"""Config flow: Sign in with SmartFilterPro, then pick the thermostats.
+
+1. Sign in (Home Assistant's OAuth flow, see oauth.py). If more than one
+   environment is registered, Home Assistant first asks which; production
+   is listed first.
+2. Choose the SmartFilterPro thermostat, when the account has several.
+3. Optionally choose the Home Assistant climate entity to forward.
+
+The config entry keeps the shape it always had (access/refresh tokens and
+expiry at the top level of entry.data), so auth.py and the rest of the
+integration work the same for entries created before this sign-in existed.
+"""
 from __future__ import annotations
 
 import json
 import logging
 from typing import Any, Dict, Iterable, Optional
 
-import aiohttp
 import voluptuous as vol
-from homeassistant import config_entries
-from homeassistant.core import callback, HomeAssistant
+from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.selector import selector  # for label/value dropdown
 
+from .auth import normalize_epoch_seconds
 from .const import (
     DOMAIN,
     # ids
     CONF_USER_ID, CONF_HVAC_ID, CONF_HVAC_UID, CONF_CLIMATE_ENTITY_ID,
-    # creds & endpoints
-    CONF_EMAIL, CONF_PASSWORD,
-    CONF_API_BASE, CONF_LOGIN_PATH, CONF_POST_PATH,
+    # endpoints
+    CONF_API_BASE, CONF_POST_PATH,
     CONF_RESET_PATH, CONF_STATUS_URL, CONF_REFRESH_PATH,
     # tokens
     CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, CONF_EXPIRES_AT,
+    CONF_CORE_TOKEN, CONF_CORE_TOKEN_EXP,
     # environment
     CONF_ENVIRONMENT, CONF_CORE_INGEST_URL, CONF_USE_TEST_ENV,
-    ENVIRONMENTS, ENV_PRODUCTION, ENV_DEV, DEFAULT_ENVIRONMENT,
+    ENVIRONMENTS, ENV_PRODUCTION, DEFAULT_ENVIRONMENT,
     # defaults
-    DEFAULT_LOGIN_PATH, DEFAULT_POST_PATH,
-    DEFAULT_RESET_PATH, DEFAULT_STATUS_URL, DEFAULT_REFRESH_PATH,
+    DEFAULT_POST_PATH, DEFAULT_RESET_PATH, DEFAULT_STATUS_URL, DEFAULT_REFRESH_PATH,
 )
+from .oauth import async_register_implementations
 
 _LOGGER = logging.getLogger(__name__)
 
-# Bubble login keys (some are aliases we accept)
+# Keys hub_token returns (some are aliases older Bubble workflows used)
 LOGIN_KEY_MAP = {
     "access_token": ("access_token", "token", "id_token"),
     "refresh_token": ("refresh_token", "rtoken"),
-    "expires_at": ("expires_at",),
-    "expires_in": ("expires_in",),
     "user_id": ("user_id", "uid"),
     "hvac_id": ("hvac_id", "primary_hvac_id"),   # may be str or list
     "hvac_ids": ("hvac_ids",),                   # optional list of ids
@@ -83,151 +93,99 @@ def _climate_entity_ids(hass: HomeAssistant) -> list[str]:
         return []
 
 
-# User-facing login schema: email/password plus the environment. The
-# environment picks BOTH the Bubble app and the Core service (see const.py);
-# almost everyone wants production, so it is the default and the dropdown is
-# the only place the others appear.
-ENVIRONMENT_OPTIONS = [
-    {"label": "Production", "value": ENV_PRODUCTION},
-    {"label": "Development (test)", "value": ENV_DEV},
-]
+def thermostats_from(body: Dict[str, Any]) -> tuple[list[str], Dict[str, str]]:
+    """Thermostat ids (in order, unique) and their names from a hub_token reply."""
+    raw_hvac_id = _pick(body, *LOGIN_KEY_MAP["hvac_id"])
+    hvac_ids_alt = _pick(body, *LOGIN_KEY_MAP["hvac_ids"]) or []
+    hvac_names = _pick(body, *LOGIN_KEY_MAP["hvac_name"]) or []
+    if not isinstance(hvac_names, list):
+        hvac_names = [hvac_names]
 
-STEP_LOGIN_SCHEMA = vol.Schema({
-    vol.Required(CONF_EMAIL): str,
-    vol.Required(CONF_PASSWORD): str,
-    vol.Optional(CONF_ENVIRONMENT, default=DEFAULT_ENVIRONMENT): selector({
-        "select": {"options": ENVIRONMENT_OPTIONS, "mode": "dropdown"}
-    }),
-})
+    ids: list[str] = []
+    if isinstance(raw_hvac_id, list):
+        ids.extend(str(x) for x in raw_hvac_id if x)
+    elif isinstance(raw_hvac_id, (str, int)) and str(raw_hvac_id):
+        ids.append(str(raw_hvac_id))
+    if isinstance(hvac_ids_alt, list):
+        ids.extend(str(x) for x in hvac_ids_alt if x)
+    seen: set[str] = set()
+    ids = [x for x in ids if not (x in seen or seen.add(x))]
+
+    names: Dict[str, str] = {}
+    for idx, _id in enumerate(ids):
+        nm = hvac_names[idx] if idx < len(hvac_names) else None
+        names[_id] = (str(nm).strip() if isinstance(nm, (str, int)) else None) or _id
+    return ids, names
 
 
-class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class SmartFilterProConfigFlow(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
+):
     """Config flow for SmartFilterPro."""
+
+    DOMAIN = DOMAIN
     VERSION = 1
 
     def __init__(self) -> None:
+        super().__init__()
         self._login_ctx: Dict[str, Any] = {}
         self._hvac_options: list[dict] = []         # [{"label": "...", "value": "..."}]
         self._hvac_name_by_id: Dict[str, str] = {}  # {"id": "friendly name"}
         self._pending_entry_data: Dict[str, Any] = {}
 
-    # ------------- Step 1: Login -------------
+    @property
+    def logger(self) -> logging.Logger:
+        return _LOGGER
+
+    # ------------- Step 1: Sign in with SmartFilterPro -------------
     async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
-        errors: Dict[str, str] = {}
+        async_register_implementations(self.hass)
+        return await super().async_step_user(user_input)
 
-        if user_input is None:
-            return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
-
-        email = user_input[CONF_EMAIL].strip()
-        password = user_input[CONF_PASSWORD]
-        environment = user_input.get(CONF_ENVIRONMENT) or DEFAULT_ENVIRONMENT
+    async def async_oauth_create_entry(self, data: dict) -> FlowResult:
+        """hub_token answered with tokens: keep them and move on to the thermostats."""
+        body: Dict[str, Any] = data.get("token") or {}
+        environment = getattr(self.flow_impl, "environment", DEFAULT_ENVIRONMENT)
         if environment not in ENVIRONMENTS:
             environment = DEFAULT_ENVIRONMENT
         env = ENVIRONMENTS[environment]
 
-        # Use defaults for all endpoints (not shown in UI)
-        api_base = env["api_base"].rstrip("/")
-        login_path = DEFAULT_LOGIN_PATH.strip("/")
-        post_path = DEFAULT_POST_PATH.strip("/")
-        reset_path = DEFAULT_RESET_PATH.strip("/")
-        refresh_path = DEFAULT_REFRESH_PATH.strip("/")
-        status_url = DEFAULT_STATUS_URL.strip("/")
-
-        login_url = f"{api_base}/{login_path}"
-
-        # Login
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(login_url, json={"email": email, "password": password}, timeout=25) as resp:
-                    txt = await resp.text()
-                    if resp.status >= 400:
-                        _LOGGER.error("Login %s -> %s %s", login_url, resp.status, txt[:500])
-                        errors["base"] = "Cannot connect"
-                        return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
-                    try:
-                        data = json.loads(txt)
-                    except Exception:
-                        _LOGGER.error("Login non-JSON: %s", txt[:500])
-                        errors["base"] = "unknown"
-                        return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
-        except Exception as e:
-            _LOGGER.exception("Login call failed: %s", e)
-            errors["base"] = "cannot_connect"
-            return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
-
-        body = data.get("response", data) if isinstance(data, dict) else {}
-
-        access_token  = _pick(body, *LOGIN_KEY_MAP["access_token"])
+        access_token = _pick(body, *LOGIN_KEY_MAP["access_token"])
         refresh_token = _pick(body, *LOGIN_KEY_MAP["refresh_token"])
-        expires_at    = _pick(body, *LOGIN_KEY_MAP["expires_at"])
-        expires_in    = _pick(body, *LOGIN_KEY_MAP["expires_in"])
-        user_id       = _pick(body, *LOGIN_KEY_MAP["user_id"])
-
-        raw_hvac_id   = _pick(body, *LOGIN_KEY_MAP["hvac_id"])  # may be str or list
-        hvac_ids_alt  = _pick(body, *LOGIN_KEY_MAP["hvac_ids"]) or []
-        hvac_names    = _pick(body, *LOGIN_KEY_MAP["hvac_name"]) or []
-
+        user_id = _pick(body, *LOGIN_KEY_MAP["user_id"])
         if not access_token or not user_id:
-            _LOGGER.error("Login response missing access_token/user_id: %s", body)
-            errors["base"] = "unknown"
-            return self.async_show_form(step_id="user", data_schema=STEP_LOGIN_SCHEMA, errors=errors)
+            # Never log the body: it holds tokens.
+            _LOGGER.error("SmartFilterPro sign-in returned no %s", "user id" if access_token else "access token")
+            return self.async_abort(reason="oauth_error")
 
-        # Convert expires_in to expires_at if needed
-        if expires_at is None and isinstance(expires_in, (int, float)):
-            import time as _t
-            expires_at = int(_t.time()) + int(expires_in)
-
-        # Normalize thermostats
-        ids: list[str] = []
-        if isinstance(raw_hvac_id, list):
-            ids.extend(str(x) for x in raw_hvac_id if x)
-        elif isinstance(raw_hvac_id, (str, int)):
-            ids.append(str(raw_hvac_id))
-        ids.extend(str(x) for x in hvac_ids_alt if x)
-        # unique (preserve order)
-        seen = set()
-        ids = [x for x in ids if not (x in seen or seen.add(x))]
-
-        # Map id -> name from aligned list (if present)
-        self._hvac_name_by_id = {}
-        for idx, _id in enumerate(ids):
-            nm = hvac_names[idx] if idx < len(hvac_names) else None
-            name = (str(nm).strip() if isinstance(nm, (str, int)) else None) or str(_id)
-            self._hvac_name_by_id[str(_id)] = name
-
-        # Build dropdown options
+        ids, self._hvac_name_by_id = thermostats_from(body)
         self._hvac_options = [{"label": f"{self._hvac_name_by_id[i]} ({i})", "value": i} for i in ids]
 
-        # Stash login context
+        expires_at = body.get("expires_at")
         self._login_ctx = {
-            CONF_EMAIL: email,
             CONF_ENVIRONMENT: environment,
             CONF_CORE_INGEST_URL: env["core_ingest_url"],
-            CONF_API_BASE: api_base,
-            CONF_LOGIN_PATH: login_path,
-            CONF_POST_PATH: post_path,
-            CONF_RESET_PATH: reset_path,
-            CONF_REFRESH_PATH: refresh_path,
-            CONF_STATUS_URL: status_url,
+            CONF_API_BASE: env["api_base"].rstrip("/"),
+            CONF_POST_PATH: DEFAULT_POST_PATH.strip("/"),
+            CONF_RESET_PATH: DEFAULT_RESET_PATH.strip("/"),
+            CONF_REFRESH_PATH: DEFAULT_REFRESH_PATH.strip("/"),
+            CONF_STATUS_URL: DEFAULT_STATUS_URL.strip("/"),
             CONF_ACCESS_TOKEN: access_token,
             CONF_REFRESH_TOKEN: refresh_token,
-            CONF_EXPIRES_AT: expires_at,
-            CONF_USER_ID: user_id,
+            CONF_EXPIRES_AT: int(expires_at) if isinstance(expires_at, (int, float)) else None,
+            CONF_USER_ID: str(user_id),
+            CONF_CORE_TOKEN: body.get("core_token"),
+            CONF_CORE_TOKEN_EXP: normalize_epoch_seconds(body.get("core_token_expires_at")),
         }
 
-        # Routing
         if not self._hvac_options:
-            _LOGGER.warning("SmartFilterPro: no thermostats found for this account; aborting setup.")
+            _LOGGER.warning("SmartFilterPro: no Home Assistant thermostats on this account")
             return self.async_abort(reason="no_thermostats_found")
-
         if len(self._hvac_options) == 1:
-            only = self._hvac_options[0]["value"]
-            _LOGGER.debug("SFP: single thermostat -> %s", only)
-            return await self._resolve_and_prepare(only)
-
+            return await self._resolve_and_prepare(self._hvac_options[0]["value"])
         return await self.async_step_hvac()
 
-    # ------------- Step 2: Choose Bubble thermostat -------------
+    # ------------- Step 2: Choose SmartFilterPro thermostat -------------
     async def async_step_hvac(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
         if user_input is None:
             schema = vol.Schema({
@@ -250,6 +208,11 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         status_url = f"{api_base}/{self._login_ctx[CONF_STATUS_URL]}"
         bubble_name = self._hvac_name_by_id.get(str(hvac_id)) if hvac_id else None
 
+        # One entry per SmartFilterPro thermostat: adding the same one twice
+        # would post its runtime twice.
+        await self.async_set_unique_id(f"{user_id}_{hvac_id}")
+        self._abort_if_unique_id_configured()
+
         self._pending_entry_data = {
             CONF_USER_ID: user_id,
             CONF_HVAC_ID: hvac_id,
@@ -267,14 +230,15 @@ class SmartFilterProConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_REFRESH_TOKEN: self._login_ctx.get(CONF_REFRESH_TOKEN),
             CONF_EXPIRES_AT: self._login_ctx.get(CONF_EXPIRES_AT),
         }
+        if self._login_ctx.get(CONF_CORE_TOKEN):
+            self._pending_entry_data[CONF_CORE_TOKEN] = self._login_ctx[CONF_CORE_TOKEN]
+            if self._login_ctx.get(CONF_CORE_TOKEN_EXP):
+                self._pending_entry_data[CONF_CORE_TOKEN_EXP] = self._login_ctx[CONF_CORE_TOKEN_EXP]
         return await self.async_step_climate()
 
     # ------------- Step 3: Optional HA climate entity (with Skip) -------------
     async def async_step_climate(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
-        try:
-            ha_climates = sorted(list(self.hass.states.async_entity_ids("climate")))
-        except Exception:
-            ha_climates = []
+        ha_climates = _climate_entity_ids(self.hass)
 
         # Always include an explicit Skip option so Submit is enabled
         choices_dict = {CHOICE_SKIP: "Skip (no thermostat)"}
