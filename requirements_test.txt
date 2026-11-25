@@ -1,0 +1,2 @@
+# Config-flow tests (tests/). Pulls in a matching Home Assistant.
+pytest-homeassistant-custom-component

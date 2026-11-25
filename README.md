@@ -42,7 +42,15 @@ After installation and restart, add the integration:
 
 1. Click the button above or go to **Settings → Devices & Services → Add Integration**.  
 2. Search for **SmartFilterPro**.  
-3. Follow the login / OAuth flow to link your account.  
+3. If asked where to sign in, choose **SmartFilterPro** (the development option is for testers).  
+4. A SmartFilterPro page opens. Sign in the way you do in the SmartFilterPro app (**Apple, Google or email**), then choose **Allow**. Home Assistant picks up from there.  
+5. If your account has several Home Assistant thermostats, choose the one to link, then (optionally) the Home Assistant climate entity to forward.  
+
+Home Assistant never sees your password. The integration gets its own sign-in from SmartFilterPro.
+
+**"No address SmartFilterPro can send you back to":** SmartFilterPro returns you to Home Assistant through **My Home Assistant** (`https://my.home-assistant.io/redirect/oauth`). It's part of Home Assistant's default configuration; if you removed `default_config:` or `my:` from `configuration.yaml`, add `my:` back and restart.
+
+**Upgrading from 0.2.x:** entries you already set up with email and password keep working; nothing to do. The email and password form is gone, so new entries use Sign in with SmartFilterPro.
 
 ---
 
@@ -58,7 +66,7 @@ The version shown in Home Assistant (Settings → Devices & Services → SmartFi
 
 ## Environment (for testers)
 
-The sign-in form has an **Environment** dropdown. Leave it on **Production** unless SmartFilterPro support asked you to test against the development environment. The choice sets both the SmartFilterPro app the integration logs into and the server it reports runtime to, so the two always match.
+When you add the integration, Home Assistant asks where to sign in: **SmartFilterPro** (production) or **SmartFilterPro (dev / test)**. Choose production unless SmartFilterPro support asked you to test against the development environment. The choice sets both the SmartFilterPro app you sign in to and the server the integration reports runtime to, so the two always match.
 
 ---
 
